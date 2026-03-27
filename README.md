@@ -18,6 +18,18 @@ cargo build --release
 
 The binary will be at `target/release/win11-taskbar-autohide.exe` (when built on Windows).
 
+## App icon setup (Windows executable)
+
+This project now supports embedding a custom icon in the Windows `.exe` via `build.rs`.
+
+1. Download an icon/image from:
+   - https://github.com/microsoft/fluentui-system-icons/blob/main/assets/Panel%20Left%20Contract/SVG/ic_fluent_panel_left_contract_24_filled.svg
+2. Convert it to `.ico` (for example, 256x256).
+3. Save it locally as `assets/taskbar-autohide.ico` (do not commit it if you want to keep it local-only).
+4. Build on Windows with `cargo build --release`.
+
+If `assets/taskbar-autohide.ico` is missing, the build will continue without an embedded icon.
+
 ## Usage
 
 Run the executable to toggle auto-hide.
