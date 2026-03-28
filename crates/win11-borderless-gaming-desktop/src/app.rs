@@ -16,14 +16,19 @@ use windows::Win32::{
     },
 };
 
+#[cfg(any(feature = "desktop-background", feature = "minimize-all-windows"))]
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
+
 #[cfg(feature = "desktop-background")]
 use windows::Win32::{
     Foundation::COLORREF,
-    System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
-    },
     UI::Shell::{DesktopWallpaper, IDesktopWallpaper},
 };
+
+#[cfg(feature = "minimize-all-windows")]
+use windows::Win32::UI::Shell::{IShellDispatch, Shell};
 
 #[cfg(feature = "desktop-icons")]
 fn find_desktop_def_view() -> Option<HWND> {
@@ -100,6 +105,24 @@ fn apply_solid_background(enable_black_background: bool) {
     }
 }
 
+#[cfg(feature = "minimize-all-windows")]
+fn minimize_all_windows() {
+    unsafe {
+        if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+            return;
+        }
+
+        let result = (|| {
+            let shell: IShellDispatch = CoCreateInstance(&Shell, None, CLSCTX_ALL)?;
+            shell.MinimizeAll()?;
+            Ok::<(), windows::core::Error>(())
+        })();
+
+        let _ = result;
+        CoUninitialize();
+    }
+}
+
 pub fn run() {
     unsafe {
         let mut appbar = APPBARDATA {
@@ -127,5 +150,10 @@ pub fn run() {
 
         #[cfg(feature = "desktop-background")]
         apply_solid_background(did_enable_autohide);
+
+        #[cfg(feature = "minimize-all-windows")]
+        if did_enable_autohide {
+            minimize_all_windows();
+        }
     }
 }

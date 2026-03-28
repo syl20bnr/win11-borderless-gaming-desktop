@@ -6,15 +6,19 @@ A tiny utility to make Windows cleaner for borderless gaming.
 
 ![Demo](https://raw.githubusercontent.com/syl20bnr/win11-borderless-gaming-desktop/refs/heads/main/crates/win11-borderless-gaming-desktop/assets/demo.gif)
 
+---
+
 ## Install
 
-### Portable pre-build from GitHub release
+### Portable executable (recommended)
 
-Download the latest portable version:
+Download the latest version from GitHub releases:
 
-[win11-borderless-gaming-desktop-portable.exe](https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/download/v1.0.0/win11-borderless-gaming-desktop.exe)
+👉 https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/latest
 
-Place the executable somewhere on your disk and then drag and drop it to the taskbar for easy toggle.
+Place the executable anywhere on your disk, then drag & drop it to the taskbar for one-click toggle.
+
+---
 
 ### With Cargo (for Rust developers)
 
@@ -22,52 +26,81 @@ Place the executable somewhere on your disk and then drag and drop it to the tas
 cargo install win11-borderless-gaming-desktop
 ```
 
-Then the executable will be located in cargo's `bin` directory. Drag and drop it to the taskbar for easy toggle.
+The executable will be installed in Cargo’s `bin` directory.
+Pin it to your taskbar for quick access.
+
+---
 
 ## What it does
 
-Run the app to toggle:
-- taskbar auto-hide
-- desktop icons
-- desktop background image (replaced with solid black when enabled)
+Run the app to toggle a **borderless gaming mode**:
+
+- enables taskbar auto-hide
+- hides desktop icons *(optional feature)*
+- replaces desktop background with solid black *(optional feature)*
+- minimizes all open windows *(optional feature)*
+
+---
 
 ## Usage
 
-Run the executable to switch between normal desktop mode and gaming mode.
+Run the executable to switch between:
 
-You can pin it to the taskbar for one-click access.
+- 🖥️ Normal desktop mode
+- 🎮 Borderless gaming mode
+
+Tip: pin it to the taskbar for instant switching.
+
+---
 
 ## Build
 
-Default build includes all features:
+Default build (all features enabled):
 
 ```bash
 cargo build --release
 ```
 
+---
+
 ## Features
 
-These features are enabled by default and can be turned off:
+Enabled by default:
 
-- `desktop-icons`: toggles desktop icons
-- `desktop-background`: toggles the desktop background image
+- `desktop-icons` → toggle desktop icons
+- `desktop-background` → toggle desktop background
+- `minimize-all-windows` → minimize all open windows when enabling gaming mode
+
+---
 
 ### Examples
 
-Build without desktop icons:
+Only background handling:
 
 ```bash
 cargo build --release --no-default-features --features desktop-background
 ```
 
-Build without desktop background handling:
+Only desktop icons:
 
 ```bash
 cargo build --release --no-default-features --features desktop-icons
 ```
 
-Build with only taskbar auto-hide:
+Only minimize all windows:
+
+```bash
+cargo build --release --no-default-features --features minimize-all-windows
+```
+
+Minimal build (taskbar only):
 
 ```bash
 cargo build --release --no-default-features
 ```
+
+---
+
+## License
+
+GNU GPL-3.0
