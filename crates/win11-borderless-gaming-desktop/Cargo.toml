@@ -1,0 +1,39 @@
+[package]
+name = "win11-borderless-gaming-desktop"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.94"
+description = "A tiny Windows utility to toggle taskbar auto-hide, desktop icons, and desktop background for borderless gaming."
+categories = ["os::windows-apis"]
+keywords = ["windows", "taskbar", "desktop", "gaming", "autohide"]
+license = "GPL-3.0-or-later"
+readme = "../../README.md"
+repository = "https://github.com/syl20bnr/win11-borderless-gaming-desktop"
+homepage = "https://github.com/syl20bnr/win11-borderless-gaming-desktop"
+include = [
+    "src/**",
+    "assets/app.ico",
+    "assets/demo.gif",
+    "assets/taskbar.png",
+    "build.rs",
+    "../../README.md",
+    "../../LICENSE*",
+    "Cargo.toml",
+]
+
+[features]
+default = ["desktop-icons", "desktop-background"]
+desktop-icons = []
+desktop-background = []
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winres = "0.1.12"

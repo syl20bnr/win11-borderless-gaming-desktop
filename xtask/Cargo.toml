@@ -1,0 +1,7 @@
+[package]
+name = "xtask"
+edition = "2024"
+
+[dependencies]
+strum = "0.27.2"
+tracel-xtask = "4.15.0"
