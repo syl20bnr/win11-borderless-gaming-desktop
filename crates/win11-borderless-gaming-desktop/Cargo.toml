@@ -13,17 +13,8 @@ homepage = "https://github.com/syl20bnr/win11-borderless-gaming-desktop"
 include = [
     "src/**",
     "assets/app.ico",
-    "assets/app.png",
-    "assets/desktop-mode-wordmark.png",
-    "assets/gui.png",
-    "assets/icon-master.png",
-    "assets/readme-logo-master.png",
-    "assets/gaming-mode-wordmark.png",
-    "assets/taskbar.png",
-    "assets/tray-activating-dim.png",
-    "assets/tray-activating.png",
-    "assets/tray-desktop.png",
-    "assets/tray-gaming.png",
+    "assets/runtime/**",
+    "assets/README.md",
     "build.rs",
     "../../README.md",
     "../../LICENSE*",
@@ -42,6 +33,7 @@ desktop-background = []
 minimize-all-windows = []
 gui = [
     "dep:eframe",
+    "dep:epaint_default_fonts",
     "dep:image",
     "dep:serde",
     "dep:tray-icon",
@@ -51,12 +43,11 @@ gui = [
 
 [dependencies]
 eframe = { version = "0.35.0", optional = true, default-features = false, features = [
-    "default_fonts",
     "glow",
     "persistence",
 ] }
+epaint_default_fonts = { version = "0.35.0", optional = true }
 image = { version = "0.25.10", optional = true, default-features = false, features = [
-    "ico",
     "png",
 ] }
 serde = { version = "1.0.228", optional = true, features = ["derive"] }

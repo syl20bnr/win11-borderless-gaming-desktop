@@ -5,8 +5,9 @@ use std::{
 };
 
 use image::{
-    DynamicImage, ExtendedColorType, ImageEncoder, Rgba, RgbaImage, codecs::png::PngEncoder,
-    imageops::FilterType,
+    DynamicImage, ExtendedColorType, ImageEncoder, Rgba, RgbaImage,
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType as ResizeFilterType,
 };
 use tracel_xtask::prelude::*;
 
@@ -14,9 +15,17 @@ const APP_PACKAGE: &str = "win11-borderless-gaming-desktop";
 const ACTION_FEATURES: &str = "desktop-icons,desktop-background,minimize-all-windows";
 const ICON_MASTER: &str = "crates/win11-borderless-gaming-desktop/assets/icon-master.png";
 const ICON_ASSETS: &str = "crates/win11-borderless-gaming-desktop/assets";
+const RUNTIME_ASSETS: &str = "crates/win11-borderless-gaming-desktop/assets/runtime";
+const DESKTOP_WORDMARK_MASTER: &str =
+    "crates/win11-borderless-gaming-desktop/assets/desktop-mode-wordmark.png";
+const GAMING_WORDMARK_MASTER: &str =
+    "crates/win11-borderless-gaming-desktop/assets/gaming-mode-wordmark.png";
 const ICO_SIZES: [u32; 9] = [16, 20, 24, 32, 40, 48, 64, 128, 256];
+const APP_ICON_SIZE: u32 = 256;
 const TRAY_SIZE: u32 = 32;
 const TRAY_SUPERSAMPLING: u32 = 4;
+// Keep this in sync with `WORDMARK_TEXTURE_HEIGHT` in `gui.rs`.
+const WORDMARK_TEXTURE_HEIGHT: u32 = 96;
 
 const DESKTOP_LED: Rgba<u8> = Rgba([148, 156, 181, 255]);
 const GAMING_LED: Rgba<u8> = Rgba([74, 222, 128, 255]);
@@ -35,11 +44,16 @@ pub struct RunCmdArgs {
 #[macros::declare_command_args(None, None)]
 pub struct IconsCmdArgs {}
 
+#[macros::declare_command_args(None, None)]
+pub struct AssetsCmdArgs {}
+
 #[macros::base_commands]
 pub enum Command {
     /// Build the app in release mode with every action, then run it.
     Run(RunCmdArgs),
-    /// Derive every application and tray icon from the transparent master artwork.
+    /// Generate compact runtime artwork plus every application and tray icon.
+    Assets(AssetsCmdArgs),
+    /// Alias for `assets`, retained for compatibility.
     Icons(IconsCmdArgs),
 }
 
@@ -47,12 +61,15 @@ fn main() -> anyhow::Result<()> {
     let (args, environment) = init_xtask::<Command>(parse_args::<Command>()?)?;
     match args.command {
         Command::Run(run_args) => handle_run(run_args),
-        Command::Icons(_) => handle_icons(),
+        Command::Assets(_) => handle_assets(),
+        Command::Icons(_) => handle_assets(),
         _ => dispatch_base_commands(args, environment),
     }
 }
 
 fn handle_run(args: RunCmdArgs) -> anyhow::Result<()> {
+    handle_assets()?;
+
     let status = std::process::Command::new("cargo")
         .args(cargo_run_args(args.no_gui))
         .status()
@@ -97,7 +114,7 @@ fn handle_icons() -> anyhow::Result<()> {
         )
     })?;
 
-    let app_png = resize_square(&master, 256);
+    let app_png = resize_square(&master, APP_ICON_SIZE);
     write_png(&assets_path.join("app.png"), &app_png)?;
     write_ico(&assets_path.join("app.ico"), &master)?;
 
@@ -128,6 +145,68 @@ fn handle_icons() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn handle_assets() -> anyhow::Result<()> {
+    handle_icons()?;
+
+    let workspace_root = workspace_root()?;
+    let runtime_path = workspace_root.join(RUNTIME_ASSETS);
+    let icon_master = load_master(&workspace_root.join(ICON_MASTER))?;
+
+    fs::create_dir_all(&runtime_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to create runtime assets directory {}: {error}",
+            runtime_path.display()
+        )
+    })?;
+
+    write_png(
+        &runtime_path.join("app.png"),
+        &resize_square(&icon_master, APP_ICON_SIZE),
+    )?;
+
+    for (name, color, highlight) in [
+        ("tray-desktop.png", DESKTOP_LED, Some(LED_HIGHLIGHT)),
+        ("tray-gaming.png", GAMING_LED, Some(LED_HIGHLIGHT)),
+        ("tray-activating.png", ACTIVATING_LED, Some(LED_HIGHLIGHT)),
+        ("tray-activating-dim.png", ACTIVATING_DIM_LED, None),
+    ] {
+        write_png(
+            &runtime_path.join(name),
+            &tray_variant(&icon_master, color, highlight),
+        )?;
+    }
+
+    for (master, output) in [
+        (DESKTOP_WORDMARK_MASTER, "desktop-mode-wordmark.png"),
+        (GAMING_WORDMARK_MASTER, "gaming-mode-wordmark.png"),
+    ] {
+        let master_path = workspace_root.join(master);
+        let source = load_rgba(&master_path)?;
+        let runtime_wordmark = prepare_wordmark(&source).ok_or_else(|| {
+            anyhow::anyhow!(
+                "wordmark master {} has no visible pixels",
+                master_path.display()
+            )
+        })?;
+        write_png(&runtime_path.join(output), &runtime_wordmark)?;
+    }
+
+    println!("Generated compact runtime assets:");
+    for name in [
+        "app.png",
+        "desktop-mode-wordmark.png",
+        "gaming-mode-wordmark.png",
+        "tray-desktop.png",
+        "tray-gaming.png",
+        "tray-activating.png",
+        "tray-activating-dim.png",
+    ] {
+        println!("  {}", runtime_path.join(name).display());
+    }
+
+    Ok(())
+}
+
 fn workspace_root() -> anyhow::Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -136,9 +215,7 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
 }
 
 fn load_master(path: &Path) -> anyhow::Result<RgbaImage> {
-    let image = image::open(path)
-        .map_err(|error| anyhow::anyhow!("failed to load icon master {}: {error}", path.display()))?
-        .into_rgba8();
+    let image = load_rgba(path)?;
 
     if image.width() != image.height() {
         anyhow::bail!(
@@ -166,10 +243,69 @@ fn load_master(path: &Path) -> anyhow::Result<RgbaImage> {
     Ok(image)
 }
 
+fn load_rgba(path: &Path) -> anyhow::Result<RgbaImage> {
+    image::open(path)
+        .map_err(|error| anyhow::anyhow!("failed to load artwork {}: {error}", path.display()))
+        .map(DynamicImage::into_rgba8)
+}
+
 fn resize_square(source: &RgbaImage, size: u32) -> RgbaImage {
     DynamicImage::ImageRgba8(source.clone())
-        .resize_exact(size, size, FilterType::Lanczos3)
+        .resize_exact(size, size, ResizeFilterType::Lanczos3)
         .into_rgba8()
+}
+
+fn prepare_wordmark(source: &RgbaImage) -> Option<RgbaImage> {
+    let (left, top, right, bottom) = alpha_bounds(source)?;
+    let cropped = image::imageops::crop_imm(
+        source,
+        left,
+        top,
+        right.saturating_sub(left) + 1,
+        bottom.saturating_sub(top) + 1,
+    )
+    .to_image();
+    let target_width = ((cropped.width() as f32 / cropped.height() as f32)
+        * WORDMARK_TEXTURE_HEIGHT as f32)
+        .round()
+        .max(1.0) as u32;
+
+    Some(image::imageops::resize(
+        &cropped,
+        target_width,
+        WORDMARK_TEXTURE_HEIGHT,
+        ResizeFilterType::Lanczos3,
+    ))
+}
+
+fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (width, height) = image.dimensions();
+    let mut left = width;
+    let mut top = height;
+    let mut right = 0;
+    let mut bottom = 0;
+    let mut found = false;
+
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] <= 8 {
+            continue;
+        }
+        found = true;
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+
+    found.then(|| {
+        const PADDING: u32 = 6;
+        (
+            left.saturating_sub(PADDING),
+            top.saturating_sub(PADDING),
+            right.saturating_add(PADDING).min(width.saturating_sub(1)),
+            bottom.saturating_add(PADDING).min(height.saturating_sub(1)),
+        )
+    })
 }
 
 fn tray_variant(
@@ -237,14 +373,18 @@ fn alpha_composite(destination: &mut Rgba<u8>, source: Rgba<u8>) {
 fn write_png(path: &Path, image: &RgbaImage) -> anyhow::Result<()> {
     let file = File::create(path)
         .map_err(|error| anyhow::anyhow!("failed to create {}: {error}", path.display()))?;
-    PngEncoder::new(BufWriter::new(file))
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            ExtendedColorType::Rgba8,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to encode {}: {error}", path.display()))
+    PngEncoder::new_with_quality(
+        BufWriter::new(file),
+        CompressionType::Best,
+        PngFilterType::Adaptive,
+    )
+    .write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        ExtendedColorType::Rgba8,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to encode {}: {error}", path.display()))
 }
 
 fn write_ico(path: &Path, master: &RgbaImage) -> anyhow::Result<()> {
@@ -287,12 +427,13 @@ fn encode_ico(master: &RgbaImage) -> anyhow::Result<Vec<u8>> {
 
 fn encode_png(image: &RgbaImage) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    PngEncoder::new(&mut bytes).write_image(
-        image.as_raw(),
-        image.width(),
-        image.height(),
-        ExtendedColorType::Rgba8,
-    )?;
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Best, PngFilterType::Adaptive)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )?;
     Ok(bytes)
 }
 
@@ -348,6 +489,66 @@ mod tests {
             assert_eq!(ico[entry], encoded_size);
             assert_eq!(ico[entry + 1], encoded_size);
         }
+    }
+
+    #[test]
+    fn runtime_wordmark_is_cropped_and_preserves_aspect_ratio() {
+        let mut master = RgbaImage::new(400, 200);
+        for y in 50..150 {
+            for x in 50..350 {
+                master.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+
+        let runtime = prepare_wordmark(&master).expect("wordmark should contain visible pixels");
+
+        assert_eq!(runtime.dimensions(), (267, WORDMARK_TEXTURE_HEIGHT));
+        assert_eq!(runtime.get_pixel(0, 0)[3], 0);
+    }
+
+    #[test]
+    fn transparent_wordmark_has_no_runtime_asset() {
+        assert!(prepare_wordmark(&RgbaImage::new(400, 200)).is_none());
+    }
+
+    #[test]
+    fn committed_runtime_assets_match_their_masters() {
+        let root = workspace_root().expect("workspace root should exist");
+        let runtime_path = root.join(RUNTIME_ASSETS);
+        let icon_master = load_master(&root.join(ICON_MASTER)).expect("icon master should load");
+
+        assert_image_eq(
+            &resize_square(&icon_master, APP_ICON_SIZE),
+            &load_rgba(&runtime_path.join("app.png")).expect("runtime app icon should load"),
+        );
+
+        for (name, color, highlight) in [
+            ("tray-desktop.png", DESKTOP_LED, Some(LED_HIGHLIGHT)),
+            ("tray-gaming.png", GAMING_LED, Some(LED_HIGHLIGHT)),
+            ("tray-activating.png", ACTIVATING_LED, Some(LED_HIGHLIGHT)),
+            ("tray-activating-dim.png", ACTIVATING_DIM_LED, None),
+        ] {
+            assert_image_eq(
+                &tray_variant(&icon_master, color, highlight),
+                &load_rgba(&runtime_path.join(name)).expect("runtime tray icon should load"),
+            );
+        }
+
+        for (master, output) in [
+            (DESKTOP_WORDMARK_MASTER, "desktop-mode-wordmark.png"),
+            (GAMING_WORDMARK_MASTER, "gaming-mode-wordmark.png"),
+        ] {
+            let source = load_rgba(&root.join(master)).expect("wordmark master should load");
+            let expected = prepare_wordmark(&source).expect("wordmark should be visible");
+            let actual =
+                load_rgba(&runtime_path.join(output)).expect("runtime wordmark should load");
+            assert_image_eq(&expected, &actual);
+        }
+    }
+
+    fn assert_image_eq(expected: &RgbaImage, actual: &RgbaImage) {
+        assert_eq!(actual.dimensions(), expected.dimensions());
+        assert_eq!(actual.as_raw(), expected.as_raw());
     }
 
     #[test]

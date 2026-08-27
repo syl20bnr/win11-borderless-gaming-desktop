@@ -175,25 +175,29 @@ cargo build --release --package win11-borderless-gaming-desktop `
 
 ### Developer power-ups
 
-Build in release mode with every feature and launch the GUI:
+Regenerate the runtime artwork, build in release mode with every feature, and
+launch the GUI:
 
 ```powershell
 cargo xtask run
 ```
 
-Build in release mode with every desktop action, launch the one-shot build, and omit `gui`:
+Regenerate the runtime artwork, build in release mode with every desktop
+action, launch the one-shot build, and omit `gui`:
 
 ```powershell
 cargo xtask run --no-gui
 ```
 
-Regenerate the application and Desktop, Activating, and Gaming tray icons from `icon-master.png`:
+Regenerate the compact embedded artwork plus the application and tray icons
+from their high-resolution masters:
 
 ```powershell
-cargo xtask icons
+cargo xtask assets
 ```
 
-The icon task does not regenerate `readme-logo-master.png` or the generated GUI mode wordmarks.
+The generated files under `assets/runtime` are the only artwork embedded by
+the GUI. `readme-logo-master.png` remains a documentation-only source image.
 
 Run the test suite and the repository checks before sending your build into ranked:
 

@@ -1,6 +1,9 @@
 use std::{
     error::Error,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     time::Duration,
 };
 
@@ -104,12 +107,7 @@ fn fixed_viewport(mut viewport: egui::ViewportBuilder) -> egui::ViewportBuilder 
 }
 
 fn window_icon() -> Option<egui::IconData> {
-    let image = image::load_from_memory_with_format(
-        include_bytes!("../assets/app.ico"),
-        image::ImageFormat::Ico,
-    )
-    .ok()?
-    .into_rgba8();
+    let image = decode_png(include_bytes!("../assets/runtime/app.png")).ok()?;
     let (width, height) = image.dimensions();
 
     Some(egui::IconData {
@@ -218,12 +216,12 @@ impl ModeWordmarks {
             desktop: load_mode_wordmark(
                 context,
                 "desktop-mode-wordmark",
-                include_bytes!("../assets/desktop-mode-wordmark.png"),
+                include_bytes!("../assets/runtime/desktop-mode-wordmark.png"),
             )?,
             gaming: load_mode_wordmark(
                 context,
                 "gaming-mode-wordmark",
-                include_bytes!("../assets/gaming-mode-wordmark.png"),
+                include_bytes!("../assets/runtime/gaming-mode-wordmark.png"),
             )?,
         })
     }
@@ -241,35 +239,10 @@ fn load_mode_wordmark(
     name: &str,
     bytes: &[u8],
 ) -> Result<ModeWordmark, image::ImageError> {
-    let source = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.into_rgba8();
-    let (source_width, source_height) = source.dimensions();
-
-    let (left, top, right, bottom) = alpha_bounds(&source).unwrap_or((
-        0,
-        0,
-        source_width.saturating_sub(1),
-        source_height.saturating_sub(1),
-    ));
-    let cropped = image::imageops::crop_imm(
-        &source,
-        left,
-        top,
-        right.saturating_sub(left) + 1,
-        bottom.saturating_sub(top) + 1,
-    )
-    .to_image();
-    let target_width = ((cropped.width() as f32 / cropped.height() as f32)
-        * WORDMARK_TEXTURE_HEIGHT as f32)
-        .round()
-        .max(1.0) as u32;
-    let resized = image::imageops::resize(
-        &cropped,
-        target_width,
-        WORDMARK_TEXTURE_HEIGHT,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let size = [resized.width() as usize, resized.height() as usize];
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, resized.as_raw());
+    let image = decode_png(bytes)?;
+    debug_assert_eq!(image.height(), WORDMARK_TEXTURE_HEIGHT);
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
     let texture = context.load_texture(name, color_image, egui::TextureOptions::LINEAR);
 
     Ok(ModeWordmark {
@@ -278,33 +251,9 @@ fn load_mode_wordmark(
     })
 }
 
-fn alpha_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
-    let (width, height) = image.dimensions();
-    let mut left = width;
-    let mut top = height;
-    let mut right = 0;
-    let mut bottom = 0;
-    let mut found = false;
-
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[3] > 8 {
-            left = left.min(x);
-            top = top.min(y);
-            right = right.max(x);
-            bottom = bottom.max(y);
-            found = true;
-        }
-    }
-
-    found.then(|| {
-        const PADDING: u32 = 6;
-        (
-            left.saturating_sub(PADDING),
-            top.saturating_sub(PADDING),
-            right.saturating_add(PADDING).min(width.saturating_sub(1)),
-            bottom.saturating_add(PADDING).min(height.saturating_sub(1)),
-        )
-    })
+fn decode_png(bytes: &[u8]) -> Result<image::RgbaImage, image::ImageError> {
+    image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+        .map(image::DynamicImage::into_rgba8)
 }
 
 impl DisplayPicker {
@@ -402,12 +351,7 @@ impl GuiApp {
     fn new(
         creation_context: &eframe::CreationContext<'_>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        // No egui interaction/layout state is persistent. In particular, never
-        // restore a scroll offset captured from an iconic 160x64 viewport.
-        creation_context
-            .egui_ctx
-            .memory_mut(|memory| *memory = egui::Memory::default());
-        configure_style(&creation_context.egui_ctx);
+        configure_context(&creation_context.egui_ctx);
         let mode_wordmarks = ModeWordmarks::load(&creation_context.egui_ctx)?;
 
         let mut settings: Settings = creation_context
@@ -983,6 +927,37 @@ impl GuiApp {
     }
 }
 
+fn app_fonts() -> egui::FontDefinitions {
+    const FONT_NAME: &str = "Ubuntu-Light";
+
+    let mut fonts = egui::FontDefinitions::empty();
+    fonts.font_data.insert(
+        FONT_NAME.to_owned(),
+        Arc::new(egui::FontData::from_static(
+            epaint_default_fonts::UBUNTU_LIGHT,
+        )),
+    );
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .get_mut(&family)
+            .expect("egui defines every built-in font family")
+            .push(FONT_NAME.to_owned());
+    }
+    fonts
+}
+
+fn configure_context(context: &egui::Context) {
+    // No egui interaction/layout state is persistent. In particular, never
+    // restore a scroll offset captured from an iconic 160x64 viewport.
+    context.memory_mut(|memory| *memory = egui::Memory::default());
+
+    // `set_fonts` queues the definitions in egui memory for the next pass, so
+    // it must happen after the memory reset above.
+    context.set_fonts(app_fonts());
+    configure_style(context);
+}
+
 impl eframe::App for GuiApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         let now = context.input(|input| input.time);
@@ -1248,16 +1223,16 @@ fn create_tray(
 
 fn tray_status_icon(state: TrayIconState) -> Result<Icon, Box<dyn Error + Send + Sync>> {
     let bytes = match state {
-        TrayIconState::Desktop => include_bytes!("../assets/tray-desktop.png").as_slice(),
+        TrayIconState::Desktop => include_bytes!("../assets/runtime/tray-desktop.png").as_slice(),
         TrayIconState::ActivatingBright => {
-            include_bytes!("../assets/tray-activating.png").as_slice()
+            include_bytes!("../assets/runtime/tray-activating.png").as_slice()
         }
         TrayIconState::ActivatingDim => {
-            include_bytes!("../assets/tray-activating-dim.png").as_slice()
+            include_bytes!("../assets/runtime/tray-activating-dim.png").as_slice()
         }
-        TrayIconState::Gaming => include_bytes!("../assets/tray-gaming.png").as_slice(),
+        TrayIconState::Gaming => include_bytes!("../assets/runtime/tray-gaming.png").as_slice(),
     };
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)?.into_rgba8();
+    let image = decode_png(bytes)?;
     let (width, height) = image.dimensions();
     Ok(Icon::from_rgba(image.into_raw(), width, height)?)
 }
@@ -1844,17 +1819,38 @@ mod tests {
     }
 
     #[test]
+    fn app_bundles_only_the_proportional_typeface_it_uses() {
+        let fonts = app_fonts();
+
+        assert_eq!(fonts.font_data.len(), 1);
+        assert!(fonts.font_data.contains_key("Ubuntu-Light"));
+        assert_eq!(fonts.families[&FontFamily::Proportional], ["Ubuntu-Light"]);
+    }
+
+    #[test]
+    fn context_initialization_keeps_the_custom_font_installed() {
+        let context = egui::Context::default();
+        configure_context(&context);
+        let mut label_size = Vec2::ZERO;
+
+        let _output = context.run_ui(egui::RawInput::default(), |ui| {
+            label_size = ui.label("Gaming mode actions").rect.size();
+        });
+
+        assert!(label_size.x > 50.0);
+        assert!(label_size.y > 10.0);
+    }
+
+    #[test]
     fn mode_wordmarks_fit_beside_the_header_and_close_button() {
         for bytes in [
-            include_bytes!("../assets/desktop-mode-wordmark.png").as_slice(),
-            include_bytes!("../assets/gaming-mode-wordmark.png").as_slice(),
+            include_bytes!("../assets/runtime/desktop-mode-wordmark.png").as_slice(),
+            include_bytes!("../assets/runtime/gaming-mode-wordmark.png").as_slice(),
         ] {
-            let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-                .unwrap()
-                .into_rgba8();
-            let (left, top, right, bottom) = alpha_bounds(&image).unwrap();
-            let aspect_ratio = (right - left + 1) as f32 / (bottom - top + 1) as f32;
+            let image = decode_png(bytes).unwrap();
+            let aspect_ratio = image.width() as f32 / image.height() as f32;
 
+            assert_eq!(image.height(), WORDMARK_TEXTURE_HEIGHT);
             assert!(aspect_ratio * WORDMARK_DISPLAY_HEIGHT <= 205.0);
         }
     }
