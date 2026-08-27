@@ -13,8 +13,17 @@ homepage = "https://github.com/syl20bnr/win11-borderless-gaming-desktop"
 include = [
     "src/**",
     "assets/app.ico",
+    "assets/app.png",
+    "assets/desktop-mode-wordmark.png",
     "assets/demo.gif",
+    "assets/gui.png",
+    "assets/icon-master.png",
+    "assets/gaming-mode-wordmark.png",
     "assets/taskbar.png",
+    "assets/tray-activating-dim.png",
+    "assets/tray-activating.png",
+    "assets/tray-desktop.png",
+    "assets/tray-gaming.png",
     "build.rs",
     "../../README.md",
     "../../LICENSE*",
@@ -22,12 +31,36 @@ include = [
 ]
 
 [features]
-default = ["desktop-icons", "desktop-background", "minimize-all-windows"]
+default = [
+    "desktop-icons",
+    "desktop-background",
+    "minimize-all-windows",
+    "gui",
+]
 desktop-icons = []
 desktop-background = []
 minimize-all-windows = []
+gui = [
+    "dep:eframe",
+    "dep:image",
+    "dep:serde",
+    "dep:tray-icon",
+    "windows/Win32_Devices_Display",
+    "windows/Win32_Graphics_Gdi",
+]
 
 [dependencies]
+eframe = { version = "0.35.0", optional = true, default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+] }
+image = { version = "0.25.10", optional = true, default-features = false, features = [
+    "ico",
+    "png",
+] }
+serde = { version = "1.0.228", optional = true, features = ["derive"] }
+tray-icon = { version = "0.23.1", optional = true, default-features = false }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",
