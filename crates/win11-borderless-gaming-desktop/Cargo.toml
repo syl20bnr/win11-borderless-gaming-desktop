@@ -27,6 +27,7 @@ default = [
     "desktop-background",
     "minimize-all-windows",
     "gui",
+    "sound",
 ]
 desktop-icons = []
 desktop-background = []
@@ -40,6 +41,7 @@ gui = [
     "windows/Win32_Devices_Display",
     "windows/Win32_Graphics_Gdi",
 ]
+sound = ["gui", "windows/Win32_Media_Audio"]
 
 [dependencies]
 eframe = { version = "0.35.0", optional = true, default-features = false, features = [

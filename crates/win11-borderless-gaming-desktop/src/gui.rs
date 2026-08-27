@@ -18,6 +18,8 @@ use tray_icon::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{HMENU, SetMenuDefaultItem};
 
+#[cfg(feature = "sound")]
+use crate::sound::{self, SoundCue};
 use crate::{
     app::{self, ToggleOptions},
     display::{self, ChangeOutcome, DisplayError, Resolution},
@@ -28,25 +30,29 @@ const APP_TITLE: &str = "Borderless Gaming Desktop";
 const STORAGE_KEY: &str = "gui-settings";
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const EFRAME_MEMORY_STORAGE_KEY: &str = "egui";
-const GAMING_COUNTDOWN_SECONDS: f64 = 4.0;
+const GAMING_COUNTDOWN_SECONDS: f64 = 3.0;
+const MODE_BUTTON_CLICK_ANIMATION_SECONDS: f64 = 0.16;
 const TRAY_BLINK_HALF_PERIOD_SECONDS: f64 = 0.5;
 const FIXED_SIZE_SETTLE_PASSES: u8 = 20;
 const WORDMARK_TEXTURE_HEIGHT: u32 = 96;
 const WORDMARK_DISPLAY_HEIGHT: f32 = 30.0;
+const WORDMARK_TEXTURE_OPTIONS: egui::TextureOptions =
+    egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear));
 const HEADER_HEIGHT: f32 = 50.0;
 const HEADER_CLOSE_CLEARANCE: f32 = 24.0;
 const WINDOW_WIDTH: f32 = 520.0;
 // Measured from the rendered content so the resolution card keeps the same
 // 24 px outer inset as the other three sides of the fixed window.
 const WINDOW_BASE_HEIGHT: f32 = 475.0;
-const COMPILED_ACTION_HEIGHT: f32 = 34.0;
-const COMPILED_ACTION_COUNT: u8 = cfg!(feature = "desktop-icons") as u8
+const COMPILED_OPTION_HEIGHT: f32 = 34.0;
+const COMPILED_OPTION_COUNT: u8 = cfg!(feature = "desktop-icons") as u8
     + cfg!(feature = "desktop-background") as u8
-    + cfg!(feature = "minimize-all-windows") as u8;
-const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, fixed_window_height(COMPILED_ACTION_COUNT)];
+    + cfg!(feature = "minimize-all-windows") as u8
+    + cfg!(feature = "sound") as u8;
+const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, fixed_window_height(COMPILED_OPTION_COUNT)];
 
-const fn fixed_window_height(action_count: u8) -> f32 {
-    WINDOW_BASE_HEIGHT + COMPILED_ACTION_HEIGHT * action_count as f32
+const fn fixed_window_height(option_count: u8) -> f32 {
+    WINDOW_BASE_HEIGHT + COMPILED_OPTION_HEIGHT * option_count as f32
 }
 
 const BACKGROUND: Color32 = Color32::from_rgb(12, 15, 22);
@@ -155,14 +161,32 @@ impl FeatureChoices {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(not(feature = "sound"), derive(Default))]
 #[serde(default)]
 struct Settings {
     features: FeatureChoices,
     active_mode_features: Option<FeatureChoices>,
     desktop_resolution: Option<Resolution>,
     gaming_resolution: Option<Resolution>,
+    #[cfg(feature = "sound")]
+    sounds_enabled: bool,
     tray_close_notice_acknowledged: bool,
+}
+
+#[cfg(feature = "sound")]
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            features: FeatureChoices::default(),
+            active_mode_features: None,
+            desktop_resolution: None,
+            gaming_resolution: None,
+            #[cfg(feature = "sound")]
+            sounds_enabled: true,
+            tray_close_notice_acknowledged: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,8 +199,33 @@ enum TrayCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModeVisualState {
     Desktop,
-    Activating(u8),
+    EnterPressed,
+    Countdown(u8),
+    Activating,
     Gaming,
+    RestorePressed,
+    Restoring,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ModeTransitionState {
+    EnterPressed(f64),
+    Countdown(f64),
+    ApplyingGaming(f64),
+    RestorePressed(f64),
+    ApplyingDesktop(f64),
+}
+
+impl ModeTransitionState {
+    fn started_at(self) -> f64 {
+        match self {
+            Self::EnterPressed(started_at)
+            | Self::Countdown(started_at)
+            | Self::ApplyingGaming(started_at)
+            | Self::RestorePressed(started_at)
+            | Self::ApplyingDesktop(started_at) => started_at,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,11 +276,22 @@ impl ModeWordmarks {
     }
 
     fn for_state(&self, state: ModeVisualState) -> &ModeWordmark {
-        match state {
-            ModeVisualState::Desktop => &self.desktop,
-            ModeVisualState::Activating(_) | ModeVisualState::Gaming => &self.gaming,
+        if mode_uses_desktop_wordmark(state) {
+            &self.desktop
+        } else {
+            &self.gaming
         }
     }
+}
+
+fn mode_uses_desktop_wordmark(state: ModeVisualState) -> bool {
+    matches!(
+        state,
+        ModeVisualState::Desktop
+            | ModeVisualState::EnterPressed
+            | ModeVisualState::Countdown(_)
+            | ModeVisualState::Restoring
+    )
 }
 
 fn load_mode_wordmark(
@@ -243,7 +303,7 @@ fn load_mode_wordmark(
     debug_assert_eq!(image.height(), WORDMARK_TEXTURE_HEIGHT);
     let size = [image.width() as usize, image.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-    let texture = context.load_texture(name, color_image, egui::TextureOptions::LINEAR);
+    let texture = context.load_texture(name, color_image, WORDMARK_TEXTURE_OPTIONS);
 
     Ok(ModeWordmark {
         texture,
@@ -340,7 +400,11 @@ struct GuiApp {
     tray_icon_state: TrayIconState,
     tray_mode_item: MenuItem,
     tray_menu_state: ModeVisualState,
-    activation_started_at: Option<f64>,
+    mode_transition: Option<ModeTransitionState>,
+    #[cfg(feature = "sound")]
+    last_countdown_digit: Option<u8>,
+    #[cfg(feature = "sound")]
+    sound_player: sound::SoundPlayer,
     close_notice_open: bool,
     fixed_size_settle_passes: u8,
     restore_actions_failed: bool,
@@ -395,7 +459,11 @@ impl GuiApp {
             tray_icon_state,
             tray_mode_item,
             tray_menu_state: mode_state,
-            activation_started_at: None,
+            mode_transition: None,
+            #[cfg(feature = "sound")]
+            last_countdown_digit: None,
+            #[cfg(feature = "sound")]
+            sound_player: sound::SoundPlayer::default(),
             close_notice_open: false,
             fixed_size_settle_passes: 0,
             restore_actions_failed: false,
@@ -452,6 +520,13 @@ impl GuiApp {
             }
         }
 
+        #[cfg(feature = "sound")]
+        if self.settings.sounds_enabled
+            && let Some(cue) = sound::transition_cue(was_enabled, report.gaming_mode_enabled)
+        {
+            self.sound_player.play(cue);
+        }
+
         self.errors = errors;
         // ChangeDisplaySettingsW can synchronously alter the viewport placement.
         // Reassert the immutable dimensions now and again after Windows settles.
@@ -465,24 +540,62 @@ impl GuiApp {
     }
 
     fn visual_state(&self, gaming_mode: bool, now: f64) -> ModeVisualState {
-        if gaming_mode {
-            ModeVisualState::Gaming
-        } else if let Some(started_at) = self.activation_started_at {
-            ModeVisualState::Activating(countdown_digit(started_at, now))
-        } else {
-            ModeVisualState::Desktop
+        match (gaming_mode, self.mode_transition) {
+            (false, Some(ModeTransitionState::EnterPressed(_))) => ModeVisualState::EnterPressed,
+            (false, Some(ModeTransitionState::Countdown(started_at))) => {
+                ModeVisualState::Countdown(countdown_digit(started_at, now))
+            }
+            (false, Some(ModeTransitionState::ApplyingGaming(_))) => ModeVisualState::Activating,
+            (true, Some(ModeTransitionState::RestorePressed(_))) => ModeVisualState::RestorePressed,
+            (true, Some(ModeTransitionState::ApplyingDesktop(_))) => ModeVisualState::Restoring,
+            (false, _) => ModeVisualState::Desktop,
+            (true, _) => ModeVisualState::Gaming,
         }
     }
 
     fn request_mode_toggle(&mut self, context: &egui::Context, now: f64) {
-        if app::gaming_mode_enabled() {
-            self.activation_started_at = None;
-            self.toggle_mode(context);
-        } else if self.activation_started_at.is_none() {
-            self.errors.clear();
-            self.pending_resolution = None;
-            self.activation_started_at = Some(now);
-            context.request_repaint();
+        if self.mode_transition.is_some() {
+            return;
+        }
+
+        self.errors.clear();
+        self.pending_resolution = None;
+        let gaming_mode = app::gaming_mode_enabled();
+        self.mode_transition = Some(if gaming_mode {
+            ModeTransitionState::RestorePressed(now)
+        } else {
+            ModeTransitionState::EnterPressed(now)
+        });
+        #[cfg(feature = "sound")]
+        {
+            self.last_countdown_digit = None;
+            if self.settings.sounds_enabled {
+                if gaming_mode {
+                    self.sound_player.warm_up();
+                } else if self.sound_player.prepare_countdown() {
+                    // Digit 3 is already queued directly after the silent
+                    // click-animation lead-in on the persistent output handle.
+                    self.last_countdown_digit = Some(3);
+                }
+            }
+        }
+        context.request_repaint();
+    }
+
+    fn clear_mode_transition(&mut self) {
+        self.mode_transition = None;
+        #[cfg(feature = "sound")]
+        {
+            self.last_countdown_digit = None;
+        }
+    }
+
+    #[cfg(feature = "sound")]
+    fn sync_countdown_sound(&mut self, digit: u8) {
+        if mark_countdown_digit(&mut self.last_countdown_digit, digit)
+            && self.settings.sounds_enabled
+        {
+            self.sound_player.play(SoundCue::Countdown);
         }
     }
 
@@ -497,11 +610,13 @@ impl GuiApp {
 
     fn desired_tray_icon_state(&self, state: ModeVisualState, now: f64) -> TrayIconState {
         match state {
-            ModeVisualState::Desktop => TrayIconState::Desktop,
-            ModeVisualState::Gaming => TrayIconState::Gaming,
-            ModeVisualState::Activating(_) => activating_tray_icon_state(
-                self.activation_started_at
-                    .map_or(0.0, |started_at| now - started_at),
+            ModeVisualState::Desktop | ModeVisualState::EnterPressed => TrayIconState::Desktop,
+            ModeVisualState::Gaming | ModeVisualState::RestorePressed => TrayIconState::Gaming,
+            ModeVisualState::Countdown(_)
+            | ModeVisualState::Activating
+            | ModeVisualState::Restoring => activating_tray_icon_state(
+                self.mode_transition
+                    .map_or(0.0, |transition| now - transition.started_at()),
             ),
         }
     }
@@ -615,22 +730,21 @@ impl GuiApp {
                 egui::Image::new(&wordmark.texture)
                     .fit_to_exact_size(wordmark_size)
                     .alt_text(match state {
-                        ModeVisualState::Desktop => "Desktop mode",
-                        ModeVisualState::Activating(_) => "Gaming mode activating",
-                        ModeVisualState::Gaming => "Gaming mode",
+                        ModeVisualState::Desktop
+                        | ModeVisualState::EnterPressed
+                        | ModeVisualState::Countdown(_) => "Desktop mode",
+                        ModeVisualState::Activating => "Gaming mode activating",
+                        ModeVisualState::Gaming | ModeVisualState::RestorePressed => "Gaming mode",
+                        ModeVisualState::Restoring => "Desktop mode restoring",
                     }),
             )
             .on_hover_text(mode_status_description(state));
     }
 
     fn show_mode_button(&mut self, ui: &mut egui::Ui, state: ModeVisualState) {
-        let (label, spinner) = match state {
-            ModeVisualState::Desktop => ("Enter gaming mode".to_owned(), false),
-            ModeVisualState::Activating(countdown) => (format!("Activating in {countdown}"), true),
-            ModeVisualState::Gaming => ("Restore desktop mode".to_owned(), false),
-        };
+        let (label, spinner) = mode_button_presentation(state);
 
-        let enabled = !matches!(state, ModeVisualState::Activating(_));
+        let enabled = mode_button_enabled(state);
         let width = ui.available_width();
         let response = ui
             .add_enabled_ui(enabled, |ui| {
@@ -658,7 +772,7 @@ impl GuiApp {
         let _ = gaming_mode;
 
         card(ui, |ui| {
-            ui.label(RichText::new("Gaming mode actions").size(15.0).strong());
+            ui.label(RichText::new("Gaming mode options").size(15.0).strong());
             ui.add_space(4.0);
 
             #[cfg(not(any(
@@ -667,7 +781,7 @@ impl GuiApp {
                 feature = "minimize-all-windows"
             )))]
             ui.label(
-                RichText::new("This build changes taskbar auto-hide only.")
+                RichText::new("Taskbar auto-hide is the only mode action in this build.")
                     .size(13.0)
                     .color(TEXT_MUTED),
             );
@@ -697,6 +811,9 @@ impl GuiApp {
                     "Minimize open windows when entering",
                 );
             });
+
+            #[cfg(feature = "sound")]
+            accent_checkbox(ui, &mut self.settings.sounds_enabled, "Enable sounds");
 
             #[cfg(any(
                 feature = "desktop-icons",
@@ -982,15 +1099,55 @@ impl eframe::App for GuiApp {
 
         let mut gaming_mode = app::gaming_mode_enabled();
 
-        if gaming_mode {
-            self.activation_started_at = None;
-        } else if let Some(started_at) = self.activation_started_at {
-            if now - started_at >= GAMING_COUNTDOWN_SECONDS {
-                self.activation_started_at = None;
-                self.toggle_mode(context);
-                gaming_mode = app::gaming_mode_enabled();
-            } else {
-                context.request_repaint_after(Duration::from_millis(16));
+        if let Some(transition) = self.mode_transition {
+            match (gaming_mode, transition) {
+                (false, ModeTransitionState::EnterPressed(clicked_at))
+                    if mode_button_click_animation_finished(clicked_at, now) =>
+                {
+                    self.mode_transition = Some(ModeTransitionState::Countdown(now));
+                    #[cfg(feature = "sound")]
+                    self.sync_countdown_sound(3);
+                    context.request_repaint();
+                }
+                (false, ModeTransitionState::EnterPressed(_)) => {
+                    context.request_repaint_after(Duration::from_millis(16));
+                }
+                (false, ModeTransitionState::Countdown(started_at))
+                    if countdown_finished(started_at, now) =>
+                {
+                    // Render the final "Activating..." state before running the
+                    // synchronous Windows actions on the following frame.
+                    self.mode_transition = Some(ModeTransitionState::ApplyingGaming(started_at));
+                    context.request_repaint();
+                }
+                (false, ModeTransitionState::Countdown(_started_at)) => {
+                    #[cfg(feature = "sound")]
+                    self.sync_countdown_sound(countdown_digit(_started_at, now));
+                    context.request_repaint_after(Duration::from_millis(16));
+                }
+                (false, ModeTransitionState::ApplyingGaming(_)) => {
+                    self.clear_mode_transition();
+                    self.toggle_mode(context);
+                    gaming_mode = app::gaming_mode_enabled();
+                }
+                (true, ModeTransitionState::RestorePressed(clicked_at))
+                    if mode_button_click_animation_finished(clicked_at, now) =>
+                {
+                    // As with activation, render "Restoring..." before the
+                    // synchronous restore work begins on the following frame.
+                    self.mode_transition = Some(ModeTransitionState::ApplyingDesktop(clicked_at));
+                    context.request_repaint();
+                }
+                (true, ModeTransitionState::RestorePressed(_)) => {
+                    context.request_repaint_after(Duration::from_millis(16));
+                }
+                (true, ModeTransitionState::ApplyingDesktop(_)) => {
+                    self.clear_mode_transition();
+                    self.toggle_mode(context);
+                    gaming_mode = app::gaming_mode_enabled();
+                }
+                // The OS mode changed outside this pending transition.
+                _ => self.clear_mode_transition(),
             }
         }
 
@@ -1304,7 +1461,8 @@ fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 #[cfg(any(
     feature = "desktop-icons",
     feature = "desktop-background",
-    feature = "minimize-all-windows"
+    feature = "minimize-all-windows",
+    feature = "sound"
 ))]
 fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
     let (rect, mut response) =
@@ -1388,11 +1546,17 @@ fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::
 
 fn mode_status_description(state: ModeVisualState) -> String {
     match state {
-        ModeVisualState::Desktop => "Desktop mode is active".to_owned(),
-        ModeVisualState::Activating(countdown) => {
+        ModeVisualState::Desktop | ModeVisualState::EnterPressed => {
+            "Desktop mode is active".to_owned()
+        }
+        ModeVisualState::Countdown(countdown) => {
             format!("Gaming mode activates in {countdown}")
         }
-        ModeVisualState::Gaming => "Gaming mode is active".to_owned(),
+        ModeVisualState::Activating => "Gaming mode is activating".to_owned(),
+        ModeVisualState::Gaming | ModeVisualState::RestorePressed => {
+            "Gaming mode is active".to_owned()
+        }
+        ModeVisualState::Restoring => "Desktop mode is restoring".to_owned(),
     }
 }
 
@@ -1401,17 +1565,26 @@ fn mode_led(ui: &mut egui::Ui, state: ModeVisualState) {
     let center = rect.center();
     let painter = ui.painter();
 
-    let powered = !matches!(state, ModeVisualState::Desktop);
-    let gaming = matches!(state, ModeVisualState::Gaming);
+    let powered = !matches!(
+        state,
+        ModeVisualState::Desktop | ModeVisualState::EnterPressed
+    );
+    let gaming = matches!(
+        state,
+        ModeVisualState::Gaming | ModeVisualState::RestorePressed
+    );
     let power_t = ui
         .ctx()
         .animate_bool_with_time(response.id.with("power"), powered, 0.30);
     let green_t = ui
         .ctx()
         .animate_bool_with_time(response.id.with("green"), gaming, 0.24);
-    let active_color = mix_color(ACTIVATING_ORANGE, GAMING_GREEN, green_t);
+    let active_color = mode_led_active_color(state, green_t);
     let color = mix_color(LED_OFF, active_color, power_t);
-    let pulse = if matches!(state, ModeVisualState::Activating(_)) {
+    let pulse = if matches!(
+        state,
+        ModeVisualState::Countdown(_) | ModeVisualState::Activating | ModeVisualState::Restoring
+    ) {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
         let time = ui.input(|input| input.time);
         0.5 + 0.5 * (time * std::f64::consts::TAU * 1.35).sin() as f32
@@ -1439,6 +1612,14 @@ fn mode_led(ui: &mut egui::Ui, state: ModeVisualState) {
     }
 
     response.on_hover_text(mode_status_description(state));
+}
+
+fn mode_led_active_color(state: ModeVisualState, green_t: f32) -> Color32 {
+    if matches!(state, ModeVisualState::Restoring) {
+        ACTIVATING_ORANGE
+    } else {
+        mix_color(ACTIVATING_ORANGE, GAMING_GREEN, green_t)
+    }
 }
 
 fn animated_text_button(
@@ -1648,7 +1829,25 @@ fn animated_selectable_row(ui: &mut egui::Ui, label: &str, selected: bool) -> eg
 }
 
 fn countdown_digit(started_at: f64, now: f64) -> u8 {
-    (3_i32 - (now - started_at).max(0.0).floor() as i32).max(0) as u8
+    (3_i32 - (now - started_at).max(0.0).floor() as i32).clamp(1, 3) as u8
+}
+
+fn countdown_finished(started_at: f64, now: f64) -> bool {
+    now - started_at >= GAMING_COUNTDOWN_SECONDS
+}
+
+fn mode_button_click_animation_finished(clicked_at: f64, now: f64) -> bool {
+    now - clicked_at >= MODE_BUTTON_CLICK_ANIMATION_SECONDS
+}
+
+#[cfg(feature = "sound")]
+fn mark_countdown_digit(last_digit: &mut Option<u8>, digit: u8) -> bool {
+    if *last_digit == Some(digit) {
+        return false;
+    }
+
+    *last_digit = Some(digit);
+    true
 }
 
 fn activating_tray_icon_state(elapsed: f64) -> TrayIconState {
@@ -1663,9 +1862,31 @@ fn activating_tray_icon_state(elapsed: f64) -> TrayIconState {
 fn tray_mode_menu_presentation(state: ModeVisualState) -> (String, bool) {
     match state {
         ModeVisualState::Desktop => ("Enter Gaming Mode".to_owned(), true),
-        ModeVisualState::Activating(countdown) => (format!("Activating in {countdown}…"), false),
+        ModeVisualState::EnterPressed => ("Enter Gaming Mode".to_owned(), false),
+        ModeVisualState::Countdown(countdown) => (format!("Activating in {countdown}…"), false),
+        ModeVisualState::Activating => ("Activating…".to_owned(), false),
         ModeVisualState::Gaming => ("Restore Desktop Mode".to_owned(), true),
+        ModeVisualState::RestorePressed => ("Restore Desktop Mode".to_owned(), false),
+        ModeVisualState::Restoring => ("Restoring…".to_owned(), false),
     }
+}
+
+fn mode_button_presentation(state: ModeVisualState) -> (String, bool) {
+    match state {
+        ModeVisualState::Desktop | ModeVisualState::EnterPressed => {
+            ("Enter gaming mode".to_owned(), false)
+        }
+        ModeVisualState::Countdown(countdown) => (format!("Activating in {countdown}"), true),
+        ModeVisualState::Activating => ("Activating...".to_owned(), false),
+        ModeVisualState::Gaming | ModeVisualState::RestorePressed => {
+            ("Restore desktop mode".to_owned(), false)
+        }
+        ModeVisualState::Restoring => ("Restoring...".to_owned(), false),
+    }
+}
+
+fn mode_button_enabled(state: ModeVisualState) -> bool {
+    matches!(state, ModeVisualState::Desktop | ModeVisualState::Gaming)
 }
 
 fn mix_color(left: Color32, right: Color32, amount: f32) -> Color32 {
@@ -1726,15 +1947,51 @@ mod tests {
     }
 
     #[test]
-    fn gaming_countdown_displays_every_digit_for_one_second() {
+    fn gaming_countdown_displays_three_two_one_then_finishes() {
         let started_at = 10.0;
 
         assert_eq!(countdown_digit(started_at, 10.0), 3);
         assert_eq!(countdown_digit(started_at, 10.999), 3);
         assert_eq!(countdown_digit(started_at, 11.0), 2);
         assert_eq!(countdown_digit(started_at, 12.0), 1);
-        assert_eq!(countdown_digit(started_at, 13.0), 0);
-        assert_eq!(countdown_digit(started_at, 13.999), 0);
+        assert_eq!(countdown_digit(started_at, 12.999), 1);
+        assert!(!countdown_finished(started_at, 12.999));
+        assert!(countdown_finished(started_at, 13.0));
+    }
+
+    #[test]
+    fn mode_transition_waits_for_the_button_click_animation() {
+        let clicked_at = 10.0;
+
+        assert!(!mode_button_click_animation_finished(clicked_at, 10.159));
+        assert!(mode_button_click_animation_finished(clicked_at, 10.160));
+        #[cfg(feature = "sound")]
+        assert_eq!(
+            MODE_BUTTON_CLICK_ANIMATION_SECONDS,
+            crate::sound::WARM_UP_MILLISECONDS as f64 / 1_000.0
+        );
+    }
+
+    #[cfg(feature = "sound")]
+    #[test]
+    fn countdown_sound_plays_once_per_visible_digit() {
+        let mut last_digit = None;
+
+        assert!(mark_countdown_digit(&mut last_digit, 3));
+        assert!(!mark_countdown_digit(&mut last_digit, 3));
+        assert!(mark_countdown_digit(&mut last_digit, 2));
+        assert!(!mark_countdown_digit(&mut last_digit, 2));
+        assert!(mark_countdown_digit(&mut last_digit, 1));
+        assert!(!mark_countdown_digit(&mut last_digit, 1));
+
+        last_digit = None;
+        assert!(mark_countdown_digit(&mut last_digit, 3));
+    }
+
+    #[cfg(feature = "sound")]
+    #[test]
+    fn sounds_are_enabled_by_default() {
+        assert!(Settings::default().sounds_enabled);
     }
 
     #[test]
@@ -1744,12 +2001,78 @@ mod tests {
             ("Enter Gaming Mode".to_owned(), true)
         );
         assert_eq!(
-            tray_mode_menu_presentation(ModeVisualState::Activating(2)),
+            tray_mode_menu_presentation(ModeVisualState::EnterPressed),
+            ("Enter Gaming Mode".to_owned(), false)
+        );
+        assert_eq!(
+            tray_mode_menu_presentation(ModeVisualState::Countdown(2)),
             ("Activating in 2…".to_owned(), false)
+        );
+        assert_eq!(
+            tray_mode_menu_presentation(ModeVisualState::Activating),
+            ("Activating…".to_owned(), false)
         );
         assert_eq!(
             tray_mode_menu_presentation(ModeVisualState::Gaming),
             ("Restore Desktop Mode".to_owned(), true)
+        );
+        assert_eq!(
+            tray_mode_menu_presentation(ModeVisualState::RestorePressed),
+            ("Restore Desktop Mode".to_owned(), false)
+        );
+        assert_eq!(
+            tray_mode_menu_presentation(ModeVisualState::Restoring),
+            ("Restoring…".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn mode_button_tracks_click_countdown_and_apply_phases() {
+        assert_eq!(
+            mode_button_presentation(ModeVisualState::EnterPressed),
+            ("Enter gaming mode".to_owned(), false)
+        );
+        assert!(!mode_button_enabled(ModeVisualState::EnterPressed));
+        assert_eq!(
+            mode_button_presentation(ModeVisualState::Countdown(1)),
+            ("Activating in 1".to_owned(), true)
+        );
+        assert!(!mode_button_enabled(ModeVisualState::Countdown(1)));
+        assert_eq!(
+            mode_button_presentation(ModeVisualState::Activating),
+            ("Activating...".to_owned(), false)
+        );
+        assert!(!mode_button_enabled(ModeVisualState::Activating));
+        assert_eq!(
+            mode_button_presentation(ModeVisualState::RestorePressed),
+            ("Restore desktop mode".to_owned(), false)
+        );
+        assert!(!mode_button_enabled(ModeVisualState::RestorePressed));
+        assert_eq!(
+            mode_button_presentation(ModeVisualState::Restoring),
+            ("Restoring...".to_owned(), false)
+        );
+        assert!(!mode_button_enabled(ModeVisualState::Restoring));
+    }
+
+    #[test]
+    fn countdown_keeps_the_desktop_wordmark_until_activation() {
+        assert!(mode_uses_desktop_wordmark(ModeVisualState::Desktop));
+        assert!(mode_uses_desktop_wordmark(ModeVisualState::Countdown(3)));
+        assert!(mode_uses_desktop_wordmark(ModeVisualState::Countdown(1)));
+        assert!(!mode_uses_desktop_wordmark(ModeVisualState::Activating));
+        assert!(!mode_uses_desktop_wordmark(ModeVisualState::Gaming));
+    }
+
+    #[test]
+    fn restoring_led_is_immediately_orange() {
+        assert_eq!(
+            mode_led_active_color(ModeVisualState::Restoring, 1.0),
+            ACTIVATING_ORANGE
+        );
+        assert_eq!(
+            mode_led_active_color(ModeVisualState::Gaming, 1.0),
+            GAMING_GREEN
         );
     }
 
@@ -1811,11 +2134,12 @@ mod tests {
     }
 
     #[test]
-    fn fixed_window_height_fits_every_compiled_action_row() {
+    fn fixed_window_height_fits_every_compiled_option_row() {
         assert_eq!(fixed_window_height(0), 475.0);
         assert_eq!(fixed_window_height(1), 509.0);
         assert_eq!(fixed_window_height(2), 543.0);
         assert_eq!(fixed_window_height(3), 577.0);
+        assert_eq!(fixed_window_height(4), 611.0);
     }
 
     #[test]
@@ -1853,5 +2177,21 @@ mod tests {
             assert_eq!(image.height(), WORDMARK_TEXTURE_HEIGHT);
             assert!(aspect_ratio * WORDMARK_DISPLAY_HEIGHT <= 205.0);
         }
+    }
+
+    #[test]
+    fn mode_wordmarks_use_linear_mipmap_antialiasing() {
+        assert_eq!(
+            WORDMARK_TEXTURE_OPTIONS.magnification,
+            egui::TextureFilter::Linear
+        );
+        assert_eq!(
+            WORDMARK_TEXTURE_OPTIONS.minification,
+            egui::TextureFilter::Linear
+        );
+        assert_eq!(
+            WORDMARK_TEXTURE_OPTIONS.mipmap_mode,
+            Some(egui::TextureFilter::Linear)
+        );
     }
 }

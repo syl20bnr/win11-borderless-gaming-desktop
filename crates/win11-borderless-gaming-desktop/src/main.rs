@@ -6,6 +6,8 @@ mod app;
 mod display;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "sound")]
+mod sound;
 
 #[cfg(feature = "gui")]
 fn show_gui_startup_error(error: &eframe::Error) {

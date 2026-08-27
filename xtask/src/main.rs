@@ -5,11 +5,13 @@ use std::{
 };
 
 use image::{
-    DynamicImage, ExtendedColorType, ImageEncoder, Rgba, RgbaImage,
+    DynamicImage, ExtendedColorType, ImageEncoder, Rgba, Rgba32FImage, RgbaImage,
     codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
     imageops::FilterType as ResizeFilterType,
 };
 use tracel_xtask::prelude::*;
+
+mod sound;
 
 const APP_PACKAGE: &str = "win11-borderless-gaming-desktop";
 const ACTION_FEATURES: &str = "desktop-icons,desktop-background,minimize-all-windows";
@@ -51,7 +53,7 @@ pub struct AssetsCmdArgs {}
 pub enum Command {
     /// Build the app in release mode with every action, then run it.
     Run(RunCmdArgs),
-    /// Generate compact runtime artwork plus every application and tray icon.
+    /// Generate compact runtime media plus every application and tray icon.
     Assets(AssetsCmdArgs),
     /// Alias for `assets`, retained for compatibility.
     Icons(IconsCmdArgs),
@@ -191,6 +193,13 @@ fn handle_assets() -> anyhow::Result<()> {
         write_png(&runtime_path.join(output), &runtime_wordmark)?;
     }
 
+    for cue in sound::Cue::ALL {
+        let output = runtime_path.join(cue.file_name());
+        fs::write(&output, sound::wav_bytes(cue)).map_err(|error| {
+            anyhow::anyhow!("failed to write sound cue {}: {error}", output.display())
+        })?;
+    }
+
     println!("Generated compact runtime assets:");
     for name in [
         "app.png",
@@ -200,6 +209,9 @@ fn handle_assets() -> anyhow::Result<()> {
         "tray-gaming.png",
         "tray-activating.png",
         "tray-activating-dim.png",
+        "countdown.wav",
+        "gaming-enter.wav",
+        "gaming-leave.wav",
     ] {
         println!("  {}", runtime_path.join(name).display());
     }
@@ -270,12 +282,71 @@ fn prepare_wordmark(source: &RgbaImage) -> Option<RgbaImage> {
         .round()
         .max(1.0) as u32;
 
-    Some(image::imageops::resize(
+    Some(resize_wordmark_antialiased(
         &cropped,
         target_width,
         WORDMARK_TEXTURE_HEIGHT,
-        ResizeFilterType::Lanczos3,
     ))
+}
+
+fn resize_wordmark_antialiased(source: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    // Resample in linear light with premultiplied alpha. Straight-alpha sRGB
+    // resizing lets arbitrary RGB values from transparent pixels bleed into
+    // edges, which shows up as dark fringes and jagged letter contours.
+    let premultiplied = Rgba32FImage::from_fn(source.width(), source.height(), |x, y| {
+        let pixel = source.get_pixel(x, y);
+        // The source masters contain near-transparent export noise. Treat it
+        // consistently with `alpha_bounds` so isolated speckles do not become
+        // visible during minification.
+        let alpha = if pixel[3] <= 8 {
+            0.0
+        } else {
+            f32::from(pixel[3]) / 255.0
+        };
+        Rgba([
+            srgb_to_linear(pixel[0]) * alpha,
+            srgb_to_linear(pixel[1]) * alpha,
+            srgb_to_linear(pixel[2]) * alpha,
+            alpha,
+        ])
+    });
+    let resized =
+        image::imageops::resize(&premultiplied, width, height, ResizeFilterType::Lanczos3);
+
+    RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = resized.get_pixel(x, y);
+        let alpha = pixel[3].clamp(0.0, 1.0);
+        let alpha_u8 = (alpha * 255.0).round() as u8;
+        if alpha_u8 == 0 {
+            return Rgba([0, 0, 0, 0]);
+        }
+
+        Rgba([
+            linear_to_srgb(pixel[0].clamp(0.0, alpha) / alpha),
+            linear_to_srgb(pixel[1].clamp(0.0, alpha) / alpha),
+            linear_to_srgb(pixel[2].clamp(0.0, alpha) / alpha),
+            alpha_u8,
+        ])
+    })
+}
+
+fn srgb_to_linear(value: u8) -> f32 {
+    let value = f32::from(value) / 255.0;
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
 }
 
 fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
@@ -512,6 +583,31 @@ mod tests {
     }
 
     #[test]
+    fn wordmark_resampling_antialiases_without_transparent_color_bleed() {
+        let mut source = RgbaImage::from_pixel(32, 32, Rgba([0, 0, 255, 0]));
+        for y in 6..26 {
+            for x in 6..26 {
+                source.put_pixel(x, y, Rgba([255, 32, 16, 255]));
+            }
+        }
+
+        let resized = resize_wordmark_antialiased(&source, 13, 13);
+        let antialiased_edges = resized
+            .pixels()
+            .filter(|pixel| (1..=254).contains(&pixel[3]))
+            .collect::<Vec<_>>();
+
+        assert!(!antialiased_edges.is_empty());
+        assert!(antialiased_edges.iter().all(|pixel| pixel[0] > pixel[2]));
+        assert!(
+            resized
+                .pixels()
+                .filter(|pixel| pixel[3] == 0)
+                .all(|pixel| pixel.0 == [0, 0, 0, 0])
+        );
+    }
+
+    #[test]
     fn committed_runtime_assets_match_their_masters() {
         let root = workspace_root().expect("workspace root should exist");
         let runtime_path = root.join(RUNTIME_ASSETS);
@@ -543,6 +639,12 @@ mod tests {
             let actual =
                 load_rgba(&runtime_path.join(output)).expect("runtime wordmark should load");
             assert_image_eq(&expected, &actual);
+        }
+
+        for cue in sound::Cue::ALL {
+            let actual = fs::read(runtime_path.join(cue.file_name()))
+                .expect("runtime sound cue should load");
+            assert_eq!(actual, sound::wav_bytes(cue));
         }
     }
 

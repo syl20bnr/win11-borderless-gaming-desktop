@@ -1,14 +1,14 @@
 <div align="center">
   <img
     src="https://raw.githubusercontent.com/syl20bnr/win11-borderless-gaming-desktop/refs/heads/main/crates/win11-borderless-gaming-desktop/assets/readme-logo-master.png"
-    width="340"
+    width="680"
     alt="Borderless Gaming Desktop logo"
   >
 
   <h1>Borderless Gaming Desktop</h1>
 
   <p><strong>The perfect gaming XP in one click.</strong></p>
-  <p>Clear the desktop. Hide the distractions. Lock in. 🎮</p>
+  <p>Built for Ultrawide monitors: work wide, then game focused. 🎮</p>
 
   <p>
     <a href="https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/latest">
@@ -30,7 +30,13 @@
 
 ---
 
-Borderless Gaming Desktop gives your Windows 11 battlestation two loadouts: a comfortable **Desktop Mode** and a distraction-free **Gaming Mode**. The normal v2 experience is the portable GUI—no installer, no terminal, and no surprise desktop changes just because you launched it.
+Borderless Gaming Desktop is made for Ultrawide monitors. It gives your Windows
+11 battlestation two loadouts: a comfortable **Desktop Mode** and a
+distraction-free **Gaming Mode**, each with its own resolution profile. Keep the
+native canvas for everyday work, then switch resolution and clear distractions
+for gaming in one click. The normal v2 experience is the portable GUI, no
+installer, no terminal, and no surprise desktop changes just because you
+launched it.
 
 ### Ready, player one?
 
@@ -41,8 +47,8 @@ Borderless Gaming Desktop gives your Windows 11 battlestation two loadouts: a co
 <p align="center">
   <img
     src="https://raw.githubusercontent.com/syl20bnr/win11-borderless-gaming-desktop/refs/heads/main/crates/win11-borderless-gaming-desktop/assets/gui.png"
-    width="519"
-    alt="Borderless Gaming Desktop in Gaming Mode"
+    width="525"
+    alt="Borderless Gaming Desktop in Gaming Mode with action and resolution options"
   >
 </p>
 
@@ -54,26 +60,49 @@ The portable release is ready to:
 - hide desktop icons
 - swap the desktop wallpaper for solid black
 - minimize open windows when entering Gaming Mode
-- switch the primary monitor to your chosen Gaming resolution
+- switch your primary Ultrawide monitor to your chosen Gaming resolution
 
-Every optional action has its own checkbox. Selecting a resolution never changes it immediately—the Desktop or Gaming profile is applied only when you switch modes. Your monitor's preferred resolution is labeled `(native)`.
+Every optional desktop action has its own checkbox. Sound effects have a separate
+**Enable sounds** checkbox and are enabled by default. Selecting a
+resolution never changes it immediately, the Desktop or Gaming profile is applied
+only when you switch modes. On an Ultrawide, you can keep the native canvas for
+Desktop Mode and choose a narrower, game-friendly profile without changing
+resolutions by hand. Your monitor's preferred resolution is labeled `(native)`.
+While Gaming Mode is active, its desktop-action checkboxes are locked until you
+restore Desktop Mode; **Enable sounds** remains adjustable.
 
 ### Two modes. One purple button.
 
-| | Desktop Mode 🖥️ | Gaming Mode 🎮 |
-|---|---|---|
-| **Taskbar** | Normal | Auto-hide |
-| **Desktop** | Icons and wallpaper restored | Your selected cleanup actions |
-| **Resolution** | Desktop profile | Gaming profile |
-| **Status LED** | Cool gray | Bright green |
+|                | Desktop Mode 🖥️               | Gaming Mode 🎮                |
+|----------------|------------------------------|-------------------------------|
+| **Taskbar**    | Normal                       | Auto-hide                     |
+| **Desktop**    | Icons and wallpaper restored | Your selected cleanup actions |
+| **Resolution** | Desktop profile              | Gaming profile                |
+| **Status LED** | Cool gray                    | Bright green                  |
 
-Press **Enter gaming mode** and the app locks the button, starts a spinner, and counts down **3 → 2 → 1 → 0**. The LED pulses orange while the tray icon blinks, then everything turns green when the battlestation is ready.
+Press **Enter gaming mode** and the button finishes its click animation before
+starting the spinner and **3 → 2 → 1** countdown. The wordmark stays **Desktop
+mode** throughout the countdown. When sound effects are enabled, each number
+gets a soft sci-fi pulse; the app silently primes its native audio output during
+the click animation so the first pulse starts cleanly. When **1** finishes, the
+spinner disappears, the wordmark switches to **Gaming mode**, and the button
+shows **Activating...** while Windows applies the mode changes. The LED pulses
+orange while the tray icon blinks, then turns green as a short power-up cue
+confirms that the battlestation is ready.
 
-Press **Restore desktop mode** when the match is over. The taskbar, selected desktop actions, and Desktop resolution return. Windows minimized on entry stay minimized—the app will not unexpectedly reopen a pile of windows over your post-game screen.
+Press **Restore desktop mode** when the match is over. Its click animation
+finishes before the wordmark switches to **Desktop mode**, the LED turns orange
+and pulses, and the spinner-free button changes to **Restoring...** while Windows
+restores the taskbar, selected desktop actions, and Desktop resolution. When
+sounds are enabled, a compact power-down cue confirms the switch. Windows
+minimized on entry stay minimized, the app will not unexpectedly reopen a pile
+of windows over your post-game screen.
 
 ### Your loadout remembers you
 
-Action checkboxes and both resolution profiles are saved automatically. Close the app, reboot, come back tomorrow—your choices are still equipped.
+Action checkboxes, the sound-effects preference, and both resolution profiles
+are saved automatically. Close the app, reboot, come back tomorrow, your choices
+are still equipped.
 
 The mode itself follows Windows taskbar auto-hide. If auto-hide is already enabled when the app starts, the app correctly opens in Gaming Mode instead of keeping a separate, stale mode flag.
 
@@ -82,11 +111,11 @@ The mode itself follows Windows taskbar auto-hide. If auto-hide is already enabl
 - The custom close button and `Alt+F4` hide the app in the system tray without leaving it in the taskbar. The first close explains this once.
 - Double-click the tray icon to reopen the window.
 - Right-click it to **Open**, **Enter Gaming Mode / Restore Desktop Mode**, or **Quit**.
-- The tray LED mirrors the app: gray for Desktop, blinking orange during countdown, and green for Gaming.
+- The tray LED mirrors the app: gray for Desktop, blinking orange during the countdown and while either mode is being applied, and green for Gaming.
 - A regular Windows minimize remains a regular taskbar minimize.
 
 > [!TIP]
-> **Quit** means quit—it does not silently change your mode. If you are still in Gaming Mode, restore Desktop Mode first when you want the everyday desktop back.
+> **Quit** means quit, it does not silently change your mode. If you are still in Gaming Mode, restore Desktop Mode first when you want the everyday desktop back.
 
 ## Advanced Users and Developers
 
@@ -118,25 +147,26 @@ Launching a default build opens the GUI and does not toggle anything on startup.
 
 ### Cargo features
 
-| Feature | Default | What it adds |
-|---|:---:|---|
-| `gui` | ✅ | Persistent egui control panel, system tray, saved settings, and primary-monitor resolution profiles |
-| `desktop-icons` | ✅ | Hides icons when entering Gaming Mode and shows them when restoring Desktop Mode |
-| `desktop-background` | ✅ | Disables the wallpaper with a solid black background, then re-enables it on restore |
-| `minimize-all-windows` | ✅ | Minimizes open windows when entering Gaming Mode only |
+| Feature                | Default | What it adds                                                                                        |
+|------------------------|:-------:|-----------------------------------------------------------------------------------------------------|
+| `gui`                  | ✅      | Persistent egui control panel, system tray, saved settings, and primary-monitor resolution profiles |
+| `sound`                | ✅      | Sound-effects checkbox plus embedded countdown and successful mode-transition cues; implies `gui`  |
+| `desktop-icons`        | ✅      | Hides icons when entering Gaming Mode and shows them when restoring Desktop Mode                    |
+| `desktop-background`   | ✅      | Disables the wallpaper with a solid black background, then re-enables it on restore                 |
+| `minimize-all-windows` | ✅      | Minimizes open windows when entering Gaming Mode only                                               |
 
 Taskbar auto-hide is the core mode switch and is always compiled, even when every Cargo feature is disabled.
 
 Some useful custom builds:
 
 ```powershell
-# GUI with taskbar handling and resolution profiles only
+# Silent GUI with taskbar handling and resolution profiles only
 cargo build --release --package win11-borderless-gaming-desktop `
   --no-default-features --features gui
 
-# GUI with selected desktop actions
+# GUI with sounds and selected desktop actions
 cargo build --release --package win11-borderless-gaming-desktop `
-  --no-default-features --features gui,desktop-icons,desktop-background
+  --no-default-features --features sound,desktop-icons,desktop-background
 ```
 
 ### Non-GUI compatibility mode
@@ -175,29 +205,34 @@ cargo build --release --package win11-borderless-gaming-desktop `
 
 ### Developer power-ups
 
-Regenerate the runtime artwork, build in release mode with every feature, and
+Regenerate the runtime media, build in release mode with every feature, and
 launch the GUI:
 
 ```powershell
 cargo xtask run
 ```
 
-Regenerate the runtime artwork, build in release mode with every desktop
+Regenerate the runtime media, build in release mode with every desktop
 action, launch the one-shot build, and omit `gui`:
 
 ```powershell
 cargo xtask run --no-gui
 ```
 
-Regenerate the compact embedded artwork plus the application and tray icons
-from their high-resolution masters:
+Regenerate the compact embedded artwork and procedural sound cues plus the
+application and tray icons:
 
 ```powershell
 cargo xtask assets
 ```
 
-The generated files under `assets/runtime` are the only artwork embedded by
-the GUI. `readme-logo-master.png` remains a documentation-only source image.
+The pipeline downsizes mode wordmarks in linear light with premultiplied alpha,
+and the GUI uses linear mipmaps so their edges stay smooth at display size.
+The GUI embeds its compact media from `assets/runtime`; `app.ico` supplies the
+executable icon. The `sound` feature embeds the three dependency-free cues,
+which total about 84 KiB; builds without `sound` contain neither those cues nor
+the Windows playback code. `gui.png` and `readme-logo-master.png` are
+documentation-only and do not affect executable size.
 
 Run the test suite and the repository checks before sending your build into ranked:
 
