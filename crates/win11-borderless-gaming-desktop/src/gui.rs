@@ -785,15 +785,15 @@ impl GuiApp {
         )?;
 
         if start_minimized {
-            creation_context
-                .egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            hide_to_tray(&creation_context.egui_ctx);
         }
 
         Ok(Self {
             settings,
             native_window,
-            window_transparency_reapply_pending: true,
+            // A tray-hidden startup is repaired when the tray opens it. Leaving
+            // this pending while hidden would schedule needless repaint loops.
+            window_transparency_reapply_pending: !start_minimized,
             display,
             mode_wordmarks,
             errors,
@@ -3123,6 +3123,24 @@ mod tests {
         assert_eq!(fixed.decorations, Some(false));
         assert_eq!(fixed.resizable, Some(false));
         assert_eq!(fixed.maximize_button, Some(false));
+    }
+
+    #[test]
+    fn tray_hidden_window_is_invisible_and_not_minimized() {
+        let context = egui::Context::default();
+
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            hide_to_tray(ui.ctx());
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+
+        assert_eq!(
+            commands,
+            &[
+                egui::ViewportCommand::Visible(false),
+                egui::ViewportCommand::Minimized(false),
+            ]
+        );
     }
 
     #[test]
