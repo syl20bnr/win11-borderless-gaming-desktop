@@ -48,7 +48,7 @@ launch minimized, and tune whole-window transparency.
 <p align="center">
   <img
     src="https://raw.githubusercontent.com/syl20bnr/win11-borderless-gaming-desktop/refs/heads/main/crates/win11-borderless-gaming-desktop/assets/gui.png"
-    width="616"
+    width="666"
     alt="Borderless Gaming Desktop in Gaming Mode with action, resolution, startup, and transparency controls"
   >
 </p>
