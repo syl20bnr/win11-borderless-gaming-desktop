@@ -36,19 +36,20 @@ distraction-free **Gaming Mode**, each with its own resolution profile. Keep the
 native canvas for everyday work, then switch resolution and clear distractions
 for gaming in one click. The normal v2 experience is the portable GUI, no
 installer, no terminal, and no surprise desktop changes just because you
-launched it.
+launched it. The GUI can also start with Windows, keep its automatic login
+launch minimized, and tune whole-window transparency.
 
 ### Ready, player one?
 
 1. [Download the latest portable executable from GitHub Releases](https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/latest).
 2. Put the `.exe` wherever you like and double-click it. That is the whole installation.
-3. Pick your Desktop and Gaming resolution profiles, choose your Gaming Mode actions, and hit the big purple button.
+3. Pick your Desktop and Gaming resolution profiles, choose your Gaming Mode actions and application behavior, then hit the big purple button.
 
 <p align="center">
   <img
     src="https://raw.githubusercontent.com/syl20bnr/win11-borderless-gaming-desktop/refs/heads/main/crates/win11-borderless-gaming-desktop/assets/gui.png"
-    width="525"
-    alt="Borderless Gaming Desktop in Gaming Mode with action and resolution options"
+    width="528"
+    alt="Borderless Gaming Desktop in Gaming Mode with action, resolution, startup, and transparency controls"
   >
 </p>
 
@@ -70,6 +71,19 @@ Desktop Mode and choose a narrower, game-friendly profile without changing
 resolutions by hand. Your monitor's preferred resolution is labeled `(native)`.
 While Gaming Mode is active, its desktop-action checkboxes are locked until you
 restore Desktop Mode; **Enable sounds** remains adjustable.
+
+### Tune the application itself
+
+The **Application behavior** card controls how the utility starts and looks:
+
+- **Start at login** adds a per-user Windows login entry, with no administrator
+  access required.
+- **Start minimized** keeps that automatic login launch out of the way; normal
+  manual launches still open the window.
+- **Window transparency** adjusts the whole panel live from fully opaque to an
+  80% safety limit, so it can never become completely invisible.
+
+The current build version is shown unobtrusively in the bottom-right corner.
 
 ### Two modes. One purple button.
 
@@ -100,9 +114,11 @@ of windows over your post-game screen.
 
 ### Your loadout remembers you
 
-Action checkboxes, the sound-effects preference, and both resolution profiles
-are saved automatically. Close the app, reboot, come back tomorrow, your choices
-are still equipped.
+Action checkboxes, the sound-effects preference, both resolution profiles, the
+minimized-start preference, and window transparency are saved automatically.
+**Start at login** reflects the real Windows login entry instead of keeping a
+separate stale flag. Close the app, reboot, come back tomorrow, your choices are
+still equipped.
 
 The mode itself follows Windows taskbar auto-hide. If auto-hide is already enabled when the app starts, the app correctly opens in Gaming Mode instead of keeping a separate, stale mode flag.
 
@@ -143,13 +159,15 @@ The executable is written to:
 target/release/win11-borderless-gaming-desktop.exe
 ```
 
-Launching a default build opens the GUI and does not toggle anything on startup.
+A normal manual launch opens the GUI and does not toggle anything on startup.
+When **Start at login** is enabled, Windows launches the same portable executable
+for the current user; **Start minimized** applies only to that automatic launch.
 
 ### Cargo features
 
 | Feature                | Default | What it adds                                                                                        |
 |------------------------|:-------:|-----------------------------------------------------------------------------------------------------|
-| `gui`                  | ✅      | Persistent egui control panel, system tray, saved settings, and primary-monitor resolution profiles |
+| `gui`                  | ✅      | Persistent egui control panel, system tray, startup/transparency settings, and resolution profiles  |
 | `sound`                | ✅      | Sound-effects checkbox plus embedded countdown and successful mode-transition cues; implies `gui`  |
 | `desktop-icons`        | ✅      | Hides icons when entering Gaming Mode and shows them when restoring Desktop Mode                    |
 | `desktop-background`   | ✅      | Disables the wallpaper with a solid black background, then re-enables it on restore                 |
@@ -178,7 +196,9 @@ Build without `gui` to preserve the v1.1 one-shot behavior. Each execution:
 3. applies every optional action compiled into that binary
 4. exits immediately
 
-There is no window, tray, countdown, saved GUI settings, resolution profile, or interactive error report in this mode.
+There is no window, tray, countdown, saved GUI settings, resolution profile,
+startup-at-login or transparency control, or interactive error report in this
+mode.
 
 One-shot build with every desktop action:
 
@@ -248,6 +268,12 @@ cargo xtask check all
 Windows taskbar auto-hide is the source of truth: disabled means Desktop Mode, enabled means Gaming Mode. A GUI build reflects external changes to that setting and applies selected actions from the control panel. A non-GUI build simply flips that state, applies its compiled actions, and exits.
 
 Resolution modes are collected from the primary monitor at GUI startup, deduplicated, and sorted by height then width from largest to smallest. Modes taller than the monitor's native height are filtered out. Windows keeps or chooses compatible refresh-rate, color-depth, and orientation values when applying the selected width and height.
+
+**Start at login** uses the current user's
+`Software\Microsoft\Windows\CurrentVersion\Run` registry key. When **Start
+minimized** is selected, the login command adds the app's internal `--minimized`
+argument. Window transparency is applied with Windows layered-window alpha and
+is capped at 80% to keep the control panel recoverable.
 
 ### License
 
