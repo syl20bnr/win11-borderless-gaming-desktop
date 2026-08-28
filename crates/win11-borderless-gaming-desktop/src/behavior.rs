@@ -3,6 +3,7 @@ use std::{ffi::OsStr, os::windows::ffi::OsStrExt as _, path::Path};
 use windows::{
     Win32::{
         Foundation::{COLORREF, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND},
+        Globalization::{CSTR_EQUAL, CompareStringOrdinal},
         System::Registry::{
             HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
             RegSetKeyValueW,
@@ -20,7 +21,7 @@ const RUN_VALUE_NAME: windows::core::PCWSTR = w!("Borderless Gaming Desktop");
 pub const START_MINIMIZED_ARGUMENT: &str = "--minimized";
 pub const MAX_TRANSPARENCY_PERCENT: u8 = 80;
 
-/// Returns whether the application has a per-user Windows login entry.
+/// Returns whether the current executable has a per-user Windows login entry.
 pub fn startup_at_login_enabled() -> Result<bool, String> {
     let mut byte_count = 0;
     let status = unsafe {
@@ -36,13 +37,38 @@ pub fn startup_at_login_enabled() -> Result<bool, String> {
     };
 
     match status {
-        ERROR_SUCCESS => Ok(true),
-        ERROR_FILE_NOT_FOUND => Ok(false),
-        error => Err(format!(
-            "Could not read the Windows login setting: {}",
-            error.to_hresult().message()
-        )),
+        ERROR_FILE_NOT_FOUND => return Ok(false),
+        ERROR_SUCCESS => {}
+        error => {
+            return Err(format!(
+                "Could not read the Windows login setting: {}",
+                error.to_hresult().message()
+            ));
+        }
     }
+
+    let mut command = vec![0_u16; (byte_count as usize).div_ceil(size_of::<u16>()).max(1)];
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            RUN_VALUE_NAME,
+            RRF_RT_REG_SZ,
+            None,
+            Some(command.as_mut_ptr().cast()),
+            Some(&mut byte_count),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "Could not read the Windows login setting: {}",
+            status.to_hresult().message()
+        ));
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not locate the application executable: {error}"))?;
+    Ok(startup_command_targets_executable(&command, &executable))
 }
 
 /// Creates, updates, or removes the current user's Windows login entry.
@@ -116,6 +142,37 @@ fn startup_command(executable: &Path, minimized: bool) -> Vec<u16> {
     command
 }
 
+fn startup_command_targets_executable(command: &[u16], executable: &Path) -> bool {
+    let Some(registered_executable) = startup_command_executable(command) else {
+        return false;
+    };
+    let executable = executable.as_os_str().encode_wide().collect::<Vec<_>>();
+
+    unsafe { CompareStringOrdinal(registered_executable, &executable, true) == CSTR_EQUAL }
+}
+
+fn startup_command_executable(command: &[u16]) -> Option<&[u16]> {
+    let command = command.split(|unit| *unit == 0).next().unwrap_or_default();
+    let executable = if command.first() == Some(&('"' as u16)) {
+        let closing_quote = command[1..].iter().position(|unit| *unit == '"' as u16)? + 1;
+        if command
+            .get(closing_quote + 1)
+            .is_some_and(|unit| *unit != b' ' as u16 && *unit != b'\t' as u16)
+        {
+            return None;
+        }
+        &command[1..closing_quote]
+    } else {
+        let end = command
+            .iter()
+            .position(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16)
+            .unwrap_or(command.len());
+        &command[..end]
+    };
+
+    (!executable.is_empty()).then_some(executable)
+}
+
 fn transparency_alpha(transparency_percent: u8) -> u8 {
     let transparency = transparency_percent.min(MAX_TRANSPARENCY_PERCENT) as f32 / 100.0;
     ((1.0 - transparency) * u8::MAX as f32).round() as u8
@@ -145,6 +202,56 @@ mod tests {
         let command = String::from_utf16(&command[..command.len() - 1]).unwrap();
 
         assert_eq!(command, r#""C:\Games\app.exe""#);
+    }
+
+    #[test]
+    fn login_command_for_the_current_path_is_enabled_regardless_of_arguments() {
+        let executable = Path::new(r"C:\Games\Borderless Gaming Desktop.exe");
+
+        assert!(startup_command_targets_executable(
+            &startup_command(executable, false),
+            executable
+        ));
+        assert!(startup_command_targets_executable(
+            &startup_command(executable, true),
+            executable
+        ));
+    }
+
+    #[test]
+    fn login_command_path_comparison_ignores_windows_path_casing() {
+        let command = startup_command(Path::new(r"C:\GAMES\ÉCRAN.EXE"), false);
+
+        assert!(startup_command_targets_executable(
+            &command,
+            Path::new(r"c:\games\écran.exe")
+        ));
+    }
+
+    #[test]
+    fn login_command_for_a_previous_path_is_not_enabled() {
+        let command = startup_command(Path::new(r"C:\Old\app.exe"), true);
+
+        assert!(!startup_command_targets_executable(
+            &command,
+            Path::new(r"C:\New\app.exe")
+        ));
+    }
+
+    #[test]
+    fn malformed_login_commands_are_not_enabled() {
+        assert!(!startup_command_targets_executable(
+            &[0],
+            Path::new(r"C:\Games\app.exe")
+        ));
+        assert!(!startup_command_targets_executable(
+            &r#""C:\Games\app.exe"#.encode_utf16().chain([0]).collect::<Vec<_>>(),
+            Path::new(r"C:\Games\app.exe")
+        ));
+        assert!(!startup_command_targets_executable(
+            &r#""C:\Games\app.exe".old --minimized"#.encode_utf16().chain([0]).collect::<Vec<_>>(),
+            Path::new(r"C:\Games\app.exe")
+        ));
     }
 
     #[test]

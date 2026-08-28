@@ -861,9 +861,6 @@ impl GuiApp {
                 );
             });
 
-            #[cfg(feature = "sound")]
-            accent_checkbox(ui, &mut self.settings.sounds_enabled, "Enable sounds");
-
             #[cfg(any(
                 feature = "desktop-icons",
                 feature = "desktop-background",
@@ -984,8 +981,11 @@ impl GuiApp {
             }
 
             let previous_minimized = self.settings.startup_minimized;
-            let minimized_response =
-                accent_checkbox(ui, &mut self.settings.startup_minimized, "Start minimized into the system tray");
+            let minimized_response = accent_checkbox(
+                ui,
+                &mut self.settings.startup_minimized,
+                "Start minimized into the system tray",
+            );
             if minimized_response.changed() && self.settings.startup_at_login {
                 if let Err(error) =
                     behavior::set_startup_at_login(true, self.settings.startup_minimized)
@@ -996,6 +996,9 @@ impl GuiApp {
                     remove_errors_containing(&mut self.errors, "Windows login setting");
                 }
             }
+
+            #[cfg(feature = "sound")]
+            accent_checkbox(ui, &mut self.settings.sounds_enabled, "Enable sounds");
 
             let previous_transparency = self.settings.window_transparency;
             let transparency_response =
