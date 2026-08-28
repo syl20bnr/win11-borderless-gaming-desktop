@@ -3,6 +3,8 @@
 mod app;
 
 #[cfg(feature = "gui")]
+mod behavior;
+#[cfg(feature = "gui")]
 mod display;
 #[cfg(feature = "gui")]
 mod gui;

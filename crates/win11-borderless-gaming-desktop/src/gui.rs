@@ -11,22 +11,28 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
     RichText, Stroke, StrokeKind, TextStyle, Vec2, WidgetInfo, WidgetType,
 };
+use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use tray_icon::{
     Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
-use windows::Win32::UI::WindowsAndMessaging::{HMENU, SetMenuDefaultItem};
+use windows::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{HMENU, SetMenuDefaultItem},
+};
 
 #[cfg(feature = "sound")]
 use crate::sound::{self, SoundCue};
 use crate::{
     app::{self, ToggleOptions},
+    behavior,
     display::{self, ChangeOutcome, DisplayError, Resolution},
 };
 
 const APP_ID: &str = "win11-borderless-gaming-desktop";
 const APP_TITLE: &str = "Borderless Gaming Desktop";
+const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const STORAGE_KEY: &str = "gui-settings";
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const EFRAME_MEMORY_STORAGE_KEY: &str = "egui";
@@ -44,6 +50,9 @@ const WINDOW_WIDTH: f32 = 520.0;
 // Measured from the rendered content so the resolution card keeps the same
 // 24 px outer inset as the other three sides of the fixed window.
 const WINDOW_BASE_HEIGHT: f32 = 475.0;
+const WINDOW_EXTRA_TOP_PADDING: f32 = 8.0;
+const APPLICATION_BEHAVIOR_SECTION_HEIGHT: f32 = 221.0;
+const TRANSPARENCY_CONTROL_HEIGHT: f32 = 66.0;
 const COMPILED_OPTION_HEIGHT: f32 = 34.0;
 const COMPILED_OPTION_COUNT: u8 = cfg!(feature = "desktop-icons") as u8
     + cfg!(feature = "desktop-background") as u8
@@ -52,7 +61,10 @@ const COMPILED_OPTION_COUNT: u8 = cfg!(feature = "desktop-icons") as u8
 const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, fixed_window_height(COMPILED_OPTION_COUNT)];
 
 const fn fixed_window_height(option_count: u8) -> f32 {
-    WINDOW_BASE_HEIGHT + COMPILED_OPTION_HEIGHT * option_count as f32
+    WINDOW_BASE_HEIGHT
+        + WINDOW_EXTRA_TOP_PADDING
+        + APPLICATION_BEHAVIOR_SECTION_HEIGHT
+        + COMPILED_OPTION_HEIGHT * option_count as f32
 }
 
 const BACKGROUND: Color32 = Color32::from_rgb(12, 15, 22);
@@ -68,6 +80,8 @@ const LED_OFF: Color32 = Color32::from_rgb(148, 156, 181);
 
 pub fn run() -> eframe::Result {
     let mut viewport = fixed_viewport(egui::ViewportBuilder::default().with_app_id(APP_ID));
+    let start_minimized =
+        std::env::args_os().any(|argument| argument == behavior::START_MINIMIZED_ARGUMENT);
 
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);
@@ -87,7 +101,9 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         APP_TITLE,
         native_options,
-        Box::new(|creation_context| Ok(Box::new(GuiApp::new(creation_context)?))),
+        Box::new(move |creation_context| {
+            Ok(Box::new(GuiApp::new(creation_context, start_minimized)?))
+        }),
     )
 }
 
@@ -162,7 +178,6 @@ impl FeatureChoices {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(not(feature = "sound"), derive(Default))]
 #[serde(default)]
 struct Settings {
     features: FeatureChoices,
@@ -171,10 +186,13 @@ struct Settings {
     gaming_resolution: Option<Resolution>,
     #[cfg(feature = "sound")]
     sounds_enabled: bool,
+    #[serde(skip)]
+    startup_at_login: bool,
+    startup_minimized: bool,
+    window_transparency: u8,
     tray_close_notice_acknowledged: bool,
 }
 
-#[cfg(feature = "sound")]
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -184,6 +202,9 @@ impl Default for Settings {
             gaming_resolution: None,
             #[cfg(feature = "sound")]
             sounds_enabled: true,
+            startup_at_login: false,
+            startup_minimized: false,
+            window_transparency: 0,
             tray_close_notice_acknowledged: false,
         }
     }
@@ -391,6 +412,7 @@ fn initialize_profile(profile: &mut Option<Resolution>, default: Resolution) {
 
 struct GuiApp {
     settings: Settings,
+    native_window: Option<HWND>,
     display: DisplayPicker,
     mode_wordmarks: ModeWordmarks,
     errors: Vec<String>,
@@ -414,6 +436,7 @@ struct GuiApp {
 impl GuiApp {
     fn new(
         creation_context: &eframe::CreationContext<'_>,
+        start_minimized: bool,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         configure_context(&creation_context.egui_ctx);
         let mode_wordmarks = ModeWordmarks::load(&creation_context.egui_ctx)?;
@@ -422,6 +445,27 @@ impl GuiApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
             .unwrap_or_default();
+        settings.window_transparency = settings
+            .window_transparency
+            .min(behavior::MAX_TRANSPARENCY_PERCENT);
+
+        let mut errors = Vec::new();
+        match behavior::startup_at_login_enabled() {
+            Ok(enabled) => settings.startup_at_login = enabled,
+            Err(error) => errors.push(error),
+        }
+
+        let native_window = native_window_handle(creation_context);
+        match native_window {
+            Some(hwnd) => {
+                if let Err(error) =
+                    behavior::set_window_transparency(hwnd, settings.window_transparency)
+                {
+                    errors.push(error);
+                }
+            }
+            None => errors.push("Could not access the native window for transparency.".to_owned()),
+        }
 
         let gaming_mode = app::gaming_mode_enabled();
         if !gaming_mode {
@@ -429,11 +473,9 @@ impl GuiApp {
         }
 
         let mut display = DisplayPicker::default();
-        let errors = display
-            .load(&mut settings)
-            .err()
-            .map(|error| vec![format!("Display modes are unavailable: {error}")])
-            .unwrap_or_default();
+        if let Err(error) = display.load(&mut settings) {
+            errors.push(format!("Display modes are unavailable: {error}"));
+        }
 
         let mode_state = if gaming_mode {
             ModeVisualState::Gaming
@@ -448,8 +490,15 @@ impl GuiApp {
         let (tray_icon, tray_mode_item, tray_commands) =
             create_tray(&creation_context.egui_ctx, tray_icon_state, mode_state)?;
 
+        if start_minimized {
+            creation_context
+                .egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         Ok(Self {
             settings,
+            native_window,
             display,
             mode_wordmarks,
             errors,
@@ -913,6 +962,62 @@ impl GuiApp {
         }
     }
 
+    fn show_application_behavior(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(RichText::new("Application behavior").size(15.0).strong());
+            ui.add_space(4.0);
+
+            let previous_startup = self.settings.startup_at_login;
+            let startup_response =
+                accent_checkbox(ui, &mut self.settings.startup_at_login, "Start at login");
+            if startup_response.changed() {
+                let result = behavior::set_startup_at_login(
+                    self.settings.startup_at_login,
+                    self.settings.startup_minimized,
+                );
+                if let Err(error) = result {
+                    self.settings.startup_at_login = previous_startup;
+                    push_unique_error(&mut self.errors, error);
+                } else {
+                    remove_errors_containing(&mut self.errors, "Windows login setting");
+                }
+            }
+
+            let previous_minimized = self.settings.startup_minimized;
+            let minimized_response =
+                accent_checkbox(ui, &mut self.settings.startup_minimized, "Start minimized into the system tray");
+            if minimized_response.changed() && self.settings.startup_at_login {
+                if let Err(error) =
+                    behavior::set_startup_at_login(true, self.settings.startup_minimized)
+                {
+                    self.settings.startup_minimized = previous_minimized;
+                    push_unique_error(&mut self.errors, error);
+                } else {
+                    remove_errors_containing(&mut self.errors, "Windows login setting");
+                }
+            }
+
+            let previous_transparency = self.settings.window_transparency;
+            let transparency_response =
+                window_transparency_slider(ui, &mut self.settings.window_transparency);
+            if transparency_response.changed() {
+                let result = self.native_window.ok_or_else(|| {
+                    "Could not access the native window for transparency.".to_owned()
+                });
+                let result = result.and_then(|hwnd| {
+                    behavior::set_window_transparency(hwnd, self.settings.window_transparency)
+                });
+
+                if let Err(error) = result {
+                    self.settings.window_transparency = previous_transparency;
+                    push_unique_error(&mut self.errors, error);
+                } else {
+                    remove_errors_containing(&mut self.errors, "window transparency");
+                }
+            }
+        });
+    }
+
     fn show_errors(&mut self, ui: &mut egui::Ui) {
         if !self.errors.is_empty() {
             ui.horizontal_top(|ui| {
@@ -1200,7 +1305,12 @@ impl eframe::App for GuiApp {
         let state = self.visual_state(gaming_mode, ui.input(|input| input.time));
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BACKGROUND).inner_margin(Margin::same(24)))
+            .frame(Frame::new().fill(BACKGROUND).inner_margin(Margin {
+                left: 24,
+                right: 24,
+                top: 32,
+                bottom: 24,
+            }))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("main-controls")
@@ -1224,12 +1334,15 @@ impl eframe::App for GuiApp {
                         self.show_feature_choices(ui, gaming_mode);
                         ui.add_space(9.0);
                         self.show_resolution_profiles(ui);
+                        ui.add_space(9.0);
+                        self.show_application_behavior(ui);
                     });
             });
 
         if window_close_button(ui.ctx()) {
             self.request_close_to_tray(ui.ctx());
         }
+        window_version_label(ui.ctx());
 
         self.show_close_notice(ui.ctx());
     }
@@ -1249,6 +1362,23 @@ impl eframe::App for GuiApp {
     fn auto_save_interval(&self) -> Duration {
         Duration::from_secs(5)
     }
+}
+
+fn native_window_handle(creation_context: &eframe::CreationContext<'_>) -> Option<HWND> {
+    match creation_context.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut _)),
+        _ => None,
+    }
+}
+
+fn push_unique_error(errors: &mut Vec<String>, error: String) {
+    if !errors.contains(&error) {
+        errors.push(error);
+    }
+}
+
+fn remove_errors_containing(errors: &mut Vec<String>, fragment: &str) {
+    errors.retain(|error| !error.contains(fragment));
 }
 
 fn request_fixed_window_size(context: &egui::Context) {
@@ -1458,12 +1588,6 @@ fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
-#[cfg(any(
-    feature = "desktop-icons",
-    feature = "desktop-background",
-    feature = "minimize-all-windows",
-    feature = "sound"
-))]
 fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
     let (rect, mut response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::click());
@@ -1542,6 +1666,91 @@ fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::
     }
 
     response
+}
+
+fn window_transparency_slider(ui: &mut egui::Ui, transparency: &mut u8) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(width, TRANSPARENCY_CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let slider_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + 28.0),
+        rect.right_bottom(),
+    );
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 52.0, rect.top()),
+        Vec2::new(52.0, 24.0),
+    );
+    let label_rect = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(badge_rect.left() - 8.0, badge_rect.bottom()),
+    );
+    let mut label_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(label_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let label_response = label_ui.label("Window transparency");
+    let mut slider_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(slider_rect)
+            .layout(Layout::top_down(Align::LEFT)),
+    );
+
+    slider_ui.spacing_mut().slider_width = slider_rect.width();
+    slider_ui.spacing_mut().slider_rail_height = 12.0;
+    slider_ui.spacing_mut().interact_size.y = slider_rect.height();
+    {
+        let visuals = slider_ui.visuals_mut();
+        visuals.selection.bg_fill = ACCENT;
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(34, 41, 56);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.5, ACCENT.gamma_multiply(0.72));
+        visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
+        visuals.widgets.hovered.bg_fill = ACCENT_HOVER;
+        visuals.widgets.hovered.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+        visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
+        visuals.widgets.active.bg_fill = ACCENT;
+        visuals.widgets.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+        visuals.widgets.active.corner_radius = CornerRadius::same(8);
+    }
+
+    let response = slider_ui
+        .add(
+            egui::Slider::new(transparency, 0..=behavior::MAX_TRANSPARENCY_PERCENT)
+                .show_value(false)
+                .trailing_fill(true)
+                .handle_shape(egui::style::HandleShape::Circle),
+        )
+        .labelled_by(label_response.id);
+
+    let hover_t = ui.ctx().animate_bool_with_time(
+        response.id.with("header-hover"),
+        response.hovered() || response.has_focus(),
+        0.16,
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect(
+        badge_rect,
+        CornerRadius::same(12),
+        color_with_alpha(ACCENT, (24.0 + 22.0 * hover_t) as u8),
+        Stroke::new(
+            1.0,
+            color_with_alpha(ACCENT_HOVER, (80.0 + 64.0 * hover_t) as u8),
+        ),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        badge_rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{transparency}%"),
+        FontId::new(12.0, FontFamily::Proportional),
+        mix_color(TEXT_MUTED, Color32::WHITE, 0.45 + hover_t * 0.55),
+    );
+
+    response
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text("0% is opaque; the safety limit is 80% transparency")
 }
 
 fn mode_status_description(state: ModeVisualState) -> String {
@@ -1765,6 +1974,21 @@ fn window_close_button(context: &egui::Context) -> bool {
         .show(context, animated_close_button)
         .inner
         .clicked()
+}
+
+fn window_version_label(context: &egui::Context) {
+    egui::Area::new(egui::Id::new("window-version"))
+        .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-8.0, -4.0))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .movable(false)
+        .show(context, |ui| {
+            ui.label(
+                RichText::new(APP_VERSION)
+                    .size(10.5)
+                    .color(color_with_alpha(TEXT_MUTED, 150)),
+            );
+        });
 }
 
 fn animated_selectable_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
@@ -1995,6 +2219,35 @@ mod tests {
     }
 
     #[test]
+    fn application_behavior_has_safe_defaults() {
+        let settings = Settings::default();
+
+        assert!(!settings.startup_at_login);
+        assert!(!settings.startup_minimized);
+        assert_eq!(settings.window_transparency, 0);
+    }
+
+    #[test]
+    fn transparency_slider_uses_the_full_available_width() {
+        let context = egui::Context::default();
+        configure_context(&context);
+        let mut transparency = 40;
+        let mut available_width = 0.0;
+        let mut slider_size = Vec2::ZERO;
+
+        let _output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_width(440.0);
+            available_width = ui.available_width();
+            slider_size = window_transparency_slider(ui, &mut transparency)
+                .rect
+                .size();
+        });
+
+        assert!((slider_size.x - available_width).abs() <= 0.5);
+        assert_eq!(slider_size.y, TRANSPARENCY_CONTROL_HEIGHT - 28.0);
+    }
+
+    #[test]
     fn tray_mode_menu_tracks_the_current_transition() {
         assert_eq!(
             tray_mode_menu_presentation(ModeVisualState::Desktop),
@@ -2135,11 +2388,11 @@ mod tests {
 
     #[test]
     fn fixed_window_height_fits_every_compiled_option_row() {
-        assert_eq!(fixed_window_height(0), 475.0);
-        assert_eq!(fixed_window_height(1), 509.0);
-        assert_eq!(fixed_window_height(2), 543.0);
-        assert_eq!(fixed_window_height(3), 577.0);
-        assert_eq!(fixed_window_height(4), 611.0);
+        assert_eq!(fixed_window_height(0), 704.0);
+        assert_eq!(fixed_window_height(1), 738.0);
+        assert_eq!(fixed_window_height(2), 772.0);
+        assert_eq!(fixed_window_height(3), 806.0);
+        assert_eq!(fixed_window_height(4), 840.0);
     }
 
     #[test]
