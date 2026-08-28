@@ -1,18 +1,51 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-
-#[cfg(feature = "gui")]
 mod behavior;
-#[cfg(feature = "gui")]
 mod display;
-#[cfg(feature = "gui")]
 mod gui;
-#[cfg(feature = "sound")]
 mod sound;
 
-#[cfg(feature = "gui")]
-fn show_gui_startup_error(error: &eframe::Error) {
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
+        System::Threading::CreateMutexW,
+        UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow},
+    },
+    core::{Result as WindowsResult, w},
+};
+
+const APP_TITLE: windows::core::PCWSTR = w!("Borderless Gaming Desktop");
+const INSTANCE_MUTEX_NAME: windows::core::PCWSTR =
+    w!(r"Local\syl20bnr.win11-borderless-gaming-desktop");
+
+struct InstanceGuard(HANDLE);
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn acquire_instance() -> WindowsResult<Option<InstanceGuard>> {
+    let handle = unsafe { CreateMutexW(None, false, INSTANCE_MUTEX_NAME) }?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(handle) };
+        show_existing_instance();
+        Ok(None)
+    } else {
+        Ok(Some(InstanceGuard(handle)))
+    }
+}
+
+fn show_existing_instance() {
+    if let Ok(window) = unsafe { FindWindowW(None, APP_TITLE) } {
+        let _ = unsafe { ShowWindow(window, SW_RESTORE) };
+        let _ = unsafe { SetForegroundWindow(window) };
+    }
+}
+
+fn show_startup_error(error: &dyn std::fmt::Display) {
     use windows::{
         Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
         core::{HSTRING, w},
@@ -32,17 +65,21 @@ fn show_gui_startup_error(error: &eframe::Error) {
 }
 
 fn main() -> std::process::ExitCode {
-    #[cfg(feature = "gui")]
-    {
-        if let Err(error) = gui::run() {
-            eprintln!("Could not start the GUI: {error}");
-            show_gui_startup_error(&error);
+    let _instance_guard = match acquire_instance() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Could not enforce single-instance mode: {error}");
+            show_startup_error(&error);
             return std::process::ExitCode::FAILURE;
         }
-    }
+    };
 
-    #[cfg(not(feature = "gui"))]
-    app::run();
+    if let Err(error) = gui::run() {
+        eprintln!("Could not start the GUI: {error}");
+        show_startup_error(&error);
+        return std::process::ExitCode::FAILURE;
+    }
 
     std::process::ExitCode::SUCCESS
 }

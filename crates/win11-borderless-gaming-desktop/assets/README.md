@@ -9,18 +9,19 @@ cargo xtask assets
 ```
 
 The command produces the multi-resolution `app.ico`, the preview `app.png`,
-the top-level tray status variants, and every file under `runtime/`. The GUI
-embeds only the compact artwork under `runtime/`, and the `sound` Cargo feature
-additionally embeds the generated cues. The high-resolution artwork masters
-are never copied into the executable. Wordmarks are cropped and Lanczos-resized
+the top-level tray status variants, and every file under `runtime/`. The app
+embeds the compact artwork and generated cues under `runtime/`. The
+high-resolution artwork masters are never copied into the executable. Wordmarks
+are cropped and Lanczos-resized
 to 96 px textures in linear light with premultiplied alpha, preventing hidden
-transparent colors from bleeding into their edges. The GUI adds linear mipmaps
+transparent colors from bleeding into their edges. The app adds linear mipmaps
 when minifying those textures so the Desktop and Gaming labels stay smooth.
 
-The countdown, Gaming Mode entry, and Gaming Mode exit WAV files are generated
-from the deterministic integer synthesizer in `xtask/src/sound.rs`. Together
-they use about 84 KiB of 48 kHz, 16-bit mono PCM, need no bundled decoder, and
-have no external recording or licensing source. Short-effect loudness is
+The countdown, Gaming Mode activation, and Gaming Mode restoration WAV files
+are generated from the deterministic integer synthesizer in
+`xtask/src/sound.rs`. Together they use about 84 KiB of 48 kHz, 16-bit mono PCM,
+need no bundled decoder, and have no external recording or licensing source.
+Short-effect loudness is
 normalized over a 100 ms window to -23 dB with a -12 dBFS peak ceiling. Smooth
 C2-continuous attack and release envelopes, explicit silent padding, a
 high-precision fixed-point oscillator, and non-interrupting playback keep the

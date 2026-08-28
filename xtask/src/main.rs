@@ -14,7 +14,6 @@ use tracel_xtask::prelude::*;
 mod sound;
 
 const APP_PACKAGE: &str = "win11-borderless-gaming-desktop";
-const ACTION_FEATURES: &str = "desktop-icons,desktop-background,minimize-all-windows";
 const ICON_MASTER: &str = "crates/win11-borderless-gaming-desktop/assets/icon-master.png";
 const ICON_ASSETS: &str = "crates/win11-borderless-gaming-desktop/assets";
 const RUNTIME_ASSETS: &str = "crates/win11-borderless-gaming-desktop/assets/runtime";
@@ -37,11 +36,7 @@ const LED_BORDER: Rgba<u8> = Rgba([17, 20, 32, 255]);
 const LED_HIGHLIGHT: Rgba<u8> = Rgba([255, 255, 255, 210]);
 
 #[macros::declare_command_args(None, None)]
-pub struct RunCmdArgs {
-    /// Build and run the one-shot app without the GUI.
-    #[arg(long)]
-    pub no_gui: bool,
-}
+pub struct RunCmdArgs {}
 
 #[macros::declare_command_args(None, None)]
 pub struct IconsCmdArgs {}
@@ -69,11 +64,11 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn handle_run(args: RunCmdArgs) -> anyhow::Result<()> {
+fn handle_run(_args: RunCmdArgs) -> anyhow::Result<()> {
     handle_assets()?;
 
     let status = std::process::Command::new("cargo")
-        .args(cargo_run_args(args.no_gui))
+        .args(cargo_run_args())
         .status()
         .map_err(|error| anyhow::anyhow!("failed to start Cargo: {error}"))?;
 
@@ -84,23 +79,15 @@ fn handle_run(args: RunCmdArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cargo_run_args(no_gui: bool) -> Vec<&'static str> {
-    let mut args = vec![
+fn cargo_run_args() -> Vec<&'static str> {
+    vec![
         "run",
         "--release",
         "--package",
         APP_PACKAGE,
         "--bin",
         APP_PACKAGE,
-    ];
-
-    if no_gui {
-        args.extend(["--no-default-features", "--features", ACTION_FEATURES]);
-    } else {
-        args.push("--all-features");
-    }
-
-    args
+    ]
 }
 
 fn handle_icons() -> anyhow::Result<()> {
@@ -513,9 +500,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gui_run_uses_release_and_every_feature() {
+    fn app_run_uses_the_release_binary() {
         assert_eq!(
-            cargo_run_args(false),
+            cargo_run_args(),
             [
                 "run",
                 "--release",
@@ -523,25 +510,6 @@ mod tests {
                 APP_PACKAGE,
                 "--bin",
                 APP_PACKAGE,
-                "--all-features",
-            ]
-        );
-    }
-
-    #[test]
-    fn no_gui_run_uses_release_and_every_action_feature() {
-        assert_eq!(
-            cargo_run_args(true),
-            [
-                "run",
-                "--release",
-                "--package",
-                APP_PACKAGE,
-                "--bin",
-                APP_PACKAGE,
-                "--no-default-features",
-                "--features",
-                ACTION_FEATURES,
             ]
         );
     }

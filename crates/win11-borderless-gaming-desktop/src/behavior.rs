@@ -9,7 +9,7 @@ use windows::{
             RegSetKeyValueW,
         },
         UI::WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes,
+            GWL_EXSTYLE, GetWindowLongPtrW, IsWindowVisible, LWA_ALPHA, SetLayeredWindowAttributes,
             SetWindowLongPtrW, WS_EX_LAYERED,
         },
     },
@@ -130,6 +130,11 @@ pub fn set_window_transparency(hwnd: HWND, transparency_percent: u8) -> Result<(
     .map_err(|error| format!("Could not change window transparency: {error}"))
 }
 
+/// Returns whether Windows has made the native app window visible.
+pub fn window_is_visible(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd) }.as_bool()
+}
+
 fn startup_command(executable: &Path, minimized: bool) -> Vec<u16> {
     let mut command = vec!['"' as u16];
     command.extend(executable.as_os_str().encode_wide());
@@ -181,6 +186,41 @@ fn transparency_alpha(transparency_percent: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetLayeredWindowAttributes,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, SW_SHOWNOACTIVATE, ShowWindow, WINDOW_EX_STYLE,
+        WS_OVERLAPPED,
+    };
+
+    struct HiddenTestWindow(HWND);
+
+    impl Drop for HiddenTestWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    fn hidden_test_window() -> HiddenTestWindow {
+        HiddenTestWindow(
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("Transparency startup test"),
+                    WS_OVERLAPPED,
+                    -32_000,
+                    -32_000,
+                    16,
+                    16,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("the built-in STATIC window class should be available"),
+        )
+    }
 
     #[test]
     fn login_command_quotes_paths_and_adds_the_minimized_argument() {
@@ -260,5 +300,50 @@ mod tests {
         assert_eq!(transparency_alpha(50), 128);
         assert_eq!(transparency_alpha(80), 51);
         assert_eq!(transparency_alpha(100), 51);
+    }
+
+    #[test]
+    fn transparency_is_installed_while_a_native_window_is_still_hidden() {
+        let window = hidden_test_window();
+
+        assert!(!window_is_visible(window.0));
+        set_window_transparency(window.0, 40).unwrap();
+
+        let style = unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) };
+        assert_ne!(style & WS_EX_LAYERED.0 as isize, 0);
+        let mut alpha = 0;
+        let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        unsafe { GetLayeredWindowAttributes(window.0, None, Some(&mut alpha), Some(&mut flags)) }
+            .unwrap();
+        assert_eq!(alpha, transparency_alpha(40));
+        assert_eq!(flags, LWA_ALPHA);
+    }
+
+    #[test]
+    fn transparency_can_be_repaired_after_show_rewrites_the_window_style() {
+        let window = hidden_test_window();
+        set_window_transparency(window.0, 40).unwrap();
+        let _ = unsafe { ShowWindow(window.0, SW_SHOWNOACTIVATE) };
+        assert!(window_is_visible(window.0));
+
+        // Model winit's Visible(true) style diff, which replaces GWL_EXSTYLE
+        // without preserving the WS_EX_LAYERED bit added by the app.
+        let style = unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) };
+        unsafe {
+            SetWindowLongPtrW(window.0, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+        }
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(window.0, GWL_EXSTYLE) } & WS_EX_LAYERED.0 as isize,
+            0
+        );
+
+        set_window_transparency(window.0, 40).unwrap();
+
+        let mut alpha = 0;
+        let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        unsafe { GetLayeredWindowAttributes(window.0, None, Some(&mut alpha), Some(&mut flags)) }
+            .unwrap();
+        assert_eq!(alpha, transparency_alpha(40));
+        assert_eq!(flags, LWA_ALPHA);
     }
 }

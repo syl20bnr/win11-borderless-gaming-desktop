@@ -1,5 +1,9 @@
 use std::{
     error::Error,
+    fs::{self, OpenOptions},
+    io::Write as _,
+    os::windows::ffi::OsStrExt as _,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver},
@@ -11,18 +15,21 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
     RichText, Stroke, StrokeKind, TextStyle, Vec2, WidgetInfo, WidgetType,
 };
-use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+use raw_window_handle::RawWindowHandle;
 use serde::{Deserialize, Serialize};
 use tray_icon::{
     Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{HMENU, SetMenuDefaultItem},
+use windows::{
+    Win32::{
+        Foundation::HWND,
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        UI::WindowsAndMessaging::{HMENU, SetMenuDefaultItem},
+    },
+    core::PCWSTR,
 };
 
-#[cfg(feature = "sound")]
 use crate::sound::{self, SoundCue};
 use crate::{
     app::{self, ToggleOptions},
@@ -34,6 +41,10 @@ const APP_ID: &str = "win11-borderless-gaming-desktop";
 const APP_TITLE: &str = "Borderless Gaming Desktop";
 const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const STORAGE_KEY: &str = "gui-settings";
+const CURRENT_SETTINGS_VERSION: u8 = 2;
+const CURRENT_MODE_STATE_VERSION: u8 = 2;
+const MODE_STATE_FILE_NAME: &str = "mode-state.ron";
+const MODE_STATE_TEMP_FILE_NAME: &str = "mode-state.tmp";
 const EFRAME_WINDOW_STORAGE_KEY: &str = "window";
 const EFRAME_MEMORY_STORAGE_KEY: &str = "egui";
 const GAMING_COUNTDOWN_SECONDS: f64 = 3.0;
@@ -47,25 +58,12 @@ const WORDMARK_TEXTURE_OPTIONS: egui::TextureOptions =
 const HEADER_HEIGHT: f32 = 50.0;
 const HEADER_CLOSE_CLEARANCE: f32 = 24.0;
 const WINDOW_WIDTH: f32 = 520.0;
-// Measured from the rendered content so the resolution card keeps the same
-// 24 px outer inset as the other three sides of the fixed window.
-const WINDOW_BASE_HEIGHT: f32 = 475.0;
-const WINDOW_EXTRA_TOP_PADDING: f32 = 8.0;
-const APPLICATION_BEHAVIOR_SECTION_HEIGHT: f32 = 221.0;
+// Measured from the full rendered app so the application-behavior card keeps
+// the same 24 px outer inset as the other three sides of the fixed window.
+const WINDOW_HEIGHT: f32 = 710.0;
 const TRANSPARENCY_CONTROL_HEIGHT: f32 = 66.0;
-const COMPILED_OPTION_HEIGHT: f32 = 34.0;
-const COMPILED_OPTION_COUNT: u8 = cfg!(feature = "desktop-icons") as u8
-    + cfg!(feature = "desktop-background") as u8
-    + cfg!(feature = "minimize-all-windows") as u8
-    + cfg!(feature = "sound") as u8;
-const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, fixed_window_height(COMPILED_OPTION_COUNT)];
-
-const fn fixed_window_height(option_count: u8) -> f32 {
-    WINDOW_BASE_HEIGHT
-        + WINDOW_EXTRA_TOP_PADDING
-        + APPLICATION_BEHAVIOR_SECTION_HEIGHT
-        + COMPILED_OPTION_HEIGHT * option_count as f32
-}
+const TRAY_MODE_MENU_POSITION: u32 = 2;
+const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, WINDOW_HEIGHT];
 
 const BACKGROUND: Color32 = Color32::from_rgb(12, 15, 22);
 const CARD: Color32 = Color32::from_rgb(22, 27, 38);
@@ -142,11 +140,9 @@ fn window_icon() -> Option<egui::IconData> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct FeatureChoices {
-    #[cfg(feature = "desktop-icons")]
+    taskbar_auto_hide: bool,
     desktop_icons: bool,
-    #[cfg(feature = "desktop-background")]
     desktop_background: bool,
-    #[cfg(feature = "minimize-all-windows")]
     minimize_all_windows: bool,
 }
 
@@ -154,11 +150,9 @@ struct FeatureChoices {
 impl Default for FeatureChoices {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "desktop-icons")]
+            taskbar_auto_hide: true,
             desktop_icons: true,
-            #[cfg(feature = "desktop-background")]
             desktop_background: true,
-            #[cfg(feature = "minimize-all-windows")]
             minimize_all_windows: true,
         }
     }
@@ -167,12 +161,46 @@ impl Default for FeatureChoices {
 impl FeatureChoices {
     fn toggle_options(&self) -> ToggleOptions {
         ToggleOptions {
-            #[cfg(feature = "desktop-icons")]
+            taskbar_auto_hide: self.taskbar_auto_hide,
             desktop_icons: self.desktop_icons,
-            #[cfg(feature = "desktop-background")]
             desktop_background: self.desktop_background,
-            #[cfg(feature = "minimize-all-windows")]
             minimize_all_windows: self.minimize_all_windows,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum ResolutionProfile {
+    Desktop,
+    Gaming,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PendingResolution {
+    profile: ResolutionProfile,
+    target: Resolution,
+}
+
+impl PendingResolution {
+    const fn desktop(target: Resolution) -> Self {
+        Self {
+            profile: ResolutionProfile::Desktop,
+            target,
+        }
+    }
+
+    const fn gaming(target: Resolution) -> Self {
+        Self {
+            profile: ResolutionProfile::Gaming,
+            target,
+        }
+    }
+
+    const fn for_mode(gaming_mode_active: bool, target: Resolution) -> Self {
+        if gaming_mode_active {
+            Self::gaming(target)
+        } else {
+            Self::desktop(target)
         }
     }
 }
@@ -180,11 +208,17 @@ impl FeatureChoices {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct Settings {
+    #[serde(default = "legacy_settings_version")]
+    settings_version: u8,
+    gaming_mode_active: bool,
     features: FeatureChoices,
     active_mode_features: Option<FeatureChoices>,
+    taskbar_auto_hide_before_activation: Option<bool>,
     desktop_resolution: Option<Resolution>,
     gaming_resolution: Option<Resolution>,
-    #[cfg(feature = "sound")]
+    pending_resolution: Option<PendingResolution>,
+    #[serde(default, skip_serializing, rename = "pending_resolution_target")]
+    legacy_pending_resolution_target: Option<Resolution>,
     sounds_enabled: bool,
     #[serde(skip)]
     startup_at_login: bool,
@@ -193,14 +227,23 @@ struct Settings {
     tray_close_notice_acknowledged: bool,
 }
 
+const fn legacy_settings_version() -> u8 {
+    0
+}
+
+#[allow(clippy::derivable_impls)]
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            settings_version: CURRENT_SETTINGS_VERSION,
+            gaming_mode_active: false,
             features: FeatureChoices::default(),
             active_mode_features: None,
+            taskbar_auto_hide_before_activation: None,
             desktop_resolution: None,
             gaming_resolution: None,
-            #[cfg(feature = "sound")]
+            pending_resolution: None,
+            legacy_pending_resolution_target: None,
             sounds_enabled: true,
             startup_at_login: false,
             startup_minimized: false,
@@ -210,7 +253,207 @@ impl Default for Settings {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+struct DurableModeState {
+    version: u8,
+    active: bool,
+    active_mode_features: Option<FeatureChoices>,
+    taskbar_auto_hide_before_activation: Option<bool>,
+    pending_resolution: Option<PendingResolution>,
+    #[serde(default, skip_serializing, rename = "pending_resolution_target")]
+    legacy_pending_resolution_target: Option<Resolution>,
+}
+
+impl Default for DurableModeState {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_MODE_STATE_VERSION,
+            active: false,
+            active_mode_features: None,
+            taskbar_auto_hide_before_activation: None,
+            pending_resolution: None,
+            legacy_pending_resolution_target: None,
+        }
+    }
+}
+
+impl DurableModeState {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            version: CURRENT_MODE_STATE_VERSION,
+            active: settings.gaming_mode_active,
+            active_mode_features: settings.active_mode_features.clone(),
+            taskbar_auto_hide_before_activation: settings.taskbar_auto_hide_before_activation,
+            pending_resolution: settings.pending_resolution,
+            legacy_pending_resolution_target: None,
+        }
+    }
+
+    fn apply_to_settings(&self, settings: &mut Settings) {
+        settings.gaming_mode_active = self.active;
+        settings.active_mode_features = self.active_mode_features.clone();
+        settings.taskbar_auto_hide_before_activation = self.taskbar_auto_hide_before_activation;
+        settings.pending_resolution = self.pending_resolution;
+        settings.legacy_pending_resolution_target = None;
+    }
+}
+
+fn migrate_durable_mode_state(state: &mut DurableModeState) -> Result<bool, String> {
+    if state.version == 1 {
+        state.pending_resolution = state.pending_resolution.or_else(|| {
+            state
+                .legacy_pending_resolution_target
+                .map(|target| PendingResolution::for_mode(state.active, target))
+        });
+        state.legacy_pending_resolution_target = None;
+        state.version = CURRENT_MODE_STATE_VERSION;
+        Ok(true)
+    } else if state.version == CURRENT_MODE_STATE_VERSION {
+        Ok(false)
+    } else {
+        Err(format!(
+            "The saved mode-state version {} is unsupported.",
+            state.version
+        ))
+    }
+}
+
+fn mode_state_paths() -> Result<(PathBuf, PathBuf), String> {
+    let directory = eframe::storage_dir(APP_ID)
+        .ok_or_else(|| "Windows did not provide an application-data directory.".to_owned())?;
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Could not create the mode-state directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok((
+        directory.join(MODE_STATE_FILE_NAME),
+        directory.join(MODE_STATE_TEMP_FILE_NAME),
+    ))
+}
+
+fn load_durable_mode_state() -> Result<Option<(DurableModeState, bool)>, String> {
+    let (path, _) = mode_state_paths()?;
+    load_durable_mode_state_at(&path)
+}
+
+fn load_durable_mode_state_at(path: &Path) -> Result<Option<(DurableModeState, bool)>, String> {
+    let serialized = match fs::read_to_string(path) {
+        Ok(serialized) => serialized,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Could not read the saved mode state {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut state: DurableModeState = ron::from_str(&serialized).map_err(|error| {
+        format!(
+            "Could not decode the saved mode state {}: {error}",
+            path.display()
+        )
+    })?;
+    let needs_persist = migrate_durable_mode_state(&mut state)?;
+    Ok(Some((state, needs_persist)))
+}
+
+fn save_durable_mode_state(state: &DurableModeState) -> Result<(), String> {
+    let (path, temporary_path) = mode_state_paths()?;
+    save_durable_mode_state_at(&path, &temporary_path, state)
+}
+
+fn save_durable_mode_state_at(
+    path: &Path,
+    temporary_path: &Path,
+    state: &DurableModeState,
+) -> Result<(), String> {
+    let serialized = ron::to_string(state)
+        .map_err(|error| format!("Could not encode the mode recovery state: {error}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(temporary_path)
+        .map_err(|error| {
+            format!(
+                "Could not open the temporary mode-state file {}: {error}",
+                temporary_path.display()
+            )
+        })?;
+    file.write_all(serialized.as_bytes()).map_err(|error| {
+        format!(
+            "Could not write the temporary mode-state file {}: {error}",
+            temporary_path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "Could not synchronize the temporary mode-state file {}: {error}",
+            temporary_path.display()
+        )
+    })?;
+    drop(file);
+
+    let temporary_wide = wide_path(temporary_path);
+    let destination_wide = wide_path(path);
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary_wide.as_ptr()),
+            PCWSTR(destination_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "Could not commit the mode-state file {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+fn migrate_settings(settings: &mut Settings, legacy_taskbar_auto_hide: bool) {
+    if settings.settings_version >= CURRENT_SETTINGS_VERSION {
+        return;
+    }
+
+    if settings.settings_version == 0 {
+        // Before the app owned its mode state, taskbar auto-hide was the source
+        // of truth. Consult it exactly once while migrating so an in-progress
+        // Gaming session remains recoverable after upgrading.
+        settings.gaming_mode_active = legacy_taskbar_auto_hide;
+        if settings.gaming_mode_active {
+            if settings.active_mode_features.is_none() {
+                settings.active_mode_features = Some(settings.features.clone());
+            }
+            if settings.features.taskbar_auto_hide {
+                // The legacy app always restored auto-hide to off.
+                settings.taskbar_auto_hide_before_activation = Some(false);
+            }
+        } else {
+            settings.active_mode_features = None;
+            settings.taskbar_auto_hide_before_activation = None;
+        }
+    }
+
+    if settings.settings_version < 2 {
+        settings.pending_resolution = settings.pending_resolution.or_else(|| {
+            settings
+                .legacy_pending_resolution_target
+                .map(|target| PendingResolution::for_mode(settings.gaming_mode_active, target))
+        });
+        settings.legacy_pending_resolution_target = None;
+    }
+    settings.settings_version = CURRENT_SETTINGS_VERSION;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrayCommand {
     Open,
     ToggleMode,
@@ -255,6 +498,15 @@ enum TrayIconState {
     ActivatingBright,
     ActivatingDim,
     Gaming,
+}
+
+struct GamingOptionsPresentation {
+    menu_items: Vec<String>,
+}
+
+struct TrayMenuItems {
+    mode: MenuItem,
+    gaming_options: Vec<MenuItem>,
 }
 
 #[derive(Clone, Copy)]
@@ -369,19 +621,18 @@ impl DisplayPicker {
         self.native = native;
         initialize_profile(&mut settings.desktop_resolution, default);
         initialize_profile(&mut settings.gaming_resolution, default);
-        replace_disallowed_profile(&mut settings.desktop_resolution, default, native);
+        // Desktop resolution is a hidden first-start restore point. Keep it
+        // intact across temporary monitor, dock, and Remote Desktop changes.
         replace_disallowed_profile(&mut settings.gaming_resolution, default, native);
 
-        // Preserve profiles that are temporarily unavailable (for example under
-        // Remote Desktop or while another monitor is connected). They remain
-        // visible but disabled instead of being silently overwritten on save.
-        for resolution in [settings.desktop_resolution, settings.gaming_resolution]
-            .into_iter()
-            .flatten()
+        // Preserve a Gaming profile that is temporarily unavailable (for
+        // example under Remote Desktop or while another monitor is connected).
+        // It remains visible but disabled instead of being overwritten on save.
+        if let Some(resolution) = settings.gaming_resolution
+            && resolution_is_allowed(resolution, native)
+            && !resolutions.contains(&resolution)
         {
-            if resolution_is_allowed(resolution, native) && !resolutions.contains(&resolution) {
-                resolutions.push(resolution);
-            }
+            resolutions.push(resolution);
         }
         display::sort_resolutions_descending(&mut resolutions);
         resolutions.dedup();
@@ -410,22 +661,32 @@ fn initialize_profile(profile: &mut Option<Resolution>, default: Resolution) {
     }
 }
 
+fn cancel_pending_gaming_resolution(pending: &mut Option<PendingResolution>) -> bool {
+    if pending.is_some_and(|pending| pending.profile == ResolutionProfile::Gaming) {
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
 struct GuiApp {
     settings: Settings,
     native_window: Option<HWND>,
+    window_transparency_reapply_pending: bool,
     display: DisplayPicker,
     mode_wordmarks: ModeWordmarks,
     errors: Vec<String>,
-    pending_resolution: Option<(Resolution, String)>,
+    pending_resolution: Option<(PendingResolution, String)>,
     tray_commands: Receiver<TrayCommand>,
     tray_icon: TrayIcon,
     tray_icon_state: TrayIconState,
     tray_mode_item: MenuItem,
     tray_menu_state: ModeVisualState,
+    tray_gaming_option_items: Vec<MenuItem>,
+    tray_gaming_option_labels: Vec<String>,
     mode_transition: Option<ModeTransitionState>,
-    #[cfg(feature = "sound")]
     last_countdown_digit: Option<u8>,
-    #[cfg(feature = "sound")]
     sound_player: sound::SoundPlayer,
     close_notice_open: bool,
     fixed_size_settle_passes: u8,
@@ -445,17 +706,41 @@ impl GuiApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
             .unwrap_or_default();
+        let mut errors = Vec::new();
+        if settings.settings_version < CURRENT_SETTINGS_VERSION {
+            migrate_settings(&mut settings, app::taskbar_auto_hide_enabled());
+        }
+        match load_durable_mode_state() {
+            Ok(Some((mode_state, needs_persist))) => {
+                mode_state.apply_to_settings(&mut settings);
+                if needs_persist && let Err(error) = save_durable_mode_state(&mode_state) {
+                    errors.push(format!(
+                        "Persistent mode state could not be upgraded: {error}"
+                    ));
+                }
+            }
+            Ok(None) => {
+                if let Err(error) =
+                    save_durable_mode_state(&DurableModeState::from_settings(&settings))
+                {
+                    errors.push(format!("Persistent mode state is unavailable: {error}"));
+                }
+            }
+            Err(error) => errors.push(format!("Persistent mode state is unavailable: {error}")),
+        }
         settings.window_transparency = settings
             .window_transparency
             .min(behavior::MAX_TRANSPARENCY_PERCENT);
 
-        let mut errors = Vec::new();
         match behavior::startup_at_login_enabled() {
             Ok(enabled) => settings.startup_at_login = enabled,
             Err(error) => errors.push(error),
         }
 
         let native_window = native_window_handle(creation_context);
+        // eframe creates the root HWND hidden and invokes the app creator before
+        // its first visible paint. Prime the restored alpha here to avoid an
+        // opaque flash, then reapply it after eframe makes the window visible.
         match native_window {
             Some(hwnd) => {
                 if let Err(error) =
@@ -467,10 +752,14 @@ impl GuiApp {
             None => errors.push("Could not access the native window for transparency.".to_owned()),
         }
 
-        let gaming_mode = app::gaming_mode_enabled();
-        if !gaming_mode {
-            settings.active_mode_features = None;
-        }
+        let gaming_mode = settings.gaming_mode_active;
+        let pending_resolution = settings.pending_resolution.map(|pending| {
+            let target = pending.target;
+            (
+                pending,
+                format!("The saved resolution change to {target} still needs to be retried."),
+            )
+        });
 
         let mut display = DisplayPicker::default();
         if let Err(error) = display.load(&mut settings) {
@@ -487,8 +776,13 @@ impl GuiApp {
         } else {
             TrayIconState::Desktop
         };
-        let (tray_icon, tray_mode_item, tray_commands) =
-            create_tray(&creation_context.egui_ctx, tray_icon_state, mode_state)?;
+        let tray_gaming_options = gaming_options_presentation(&settings);
+        let (tray_icon, tray_menu_items, tray_commands) = create_tray(
+            &creation_context.egui_ctx,
+            tray_icon_state,
+            mode_state,
+            &tray_gaming_options,
+        )?;
 
         if start_minimized {
             creation_context
@@ -499,19 +793,20 @@ impl GuiApp {
         Ok(Self {
             settings,
             native_window,
+            window_transparency_reapply_pending: true,
             display,
             mode_wordmarks,
             errors,
-            pending_resolution: None,
+            pending_resolution,
             tray_commands,
             tray_icon,
             tray_icon_state,
-            tray_mode_item,
+            tray_mode_item: tray_menu_items.mode,
             tray_menu_state: mode_state,
+            tray_gaming_option_items: tray_menu_items.gaming_options,
+            tray_gaming_option_labels: tray_gaming_options.menu_items,
             mode_transition: None,
-            #[cfg(feature = "sound")]
             last_countdown_digit: None,
-            #[cfg(feature = "sound")]
             sound_player: sound::SoundPlayer::default(),
             close_notice_open: false,
             fixed_size_settle_passes: 0,
@@ -520,10 +815,41 @@ impl GuiApp {
         })
     }
 
-    fn toggle_mode(&mut self, context: &egui::Context) {
+    fn reapply_window_transparency_after_show(
+        &mut self,
+        context: &egui::Context,
+        frame: &eframe::Frame,
+    ) {
+        if !self.window_transparency_reapply_pending {
+            return;
+        }
+
+        self.native_window = native_window_handle(frame).or(self.native_window);
+        let Some(hwnd) = self.native_window else {
+            self.window_transparency_reapply_pending = false;
+            push_unique_error(
+                &mut self.errors,
+                "Could not access the native window for transparency.".to_owned(),
+            );
+            return;
+        };
+
+        if !behavior::window_is_visible(hwnd) {
+            context.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        self.window_transparency_reapply_pending = false;
+        match behavior::set_window_transparency(hwnd, self.settings.window_transparency) {
+            Ok(()) => remove_errors_containing(&mut self.errors, "transparency"),
+            Err(error) => push_unique_error(&mut self.errors, error),
+        }
+    }
+
+    fn toggle_mode(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         self.errors.clear();
         self.pending_resolution = None;
-        let was_enabled = app::gaming_mode_enabled();
+        let was_enabled = self.settings.gaming_mode_active;
         let choices = if was_enabled {
             self.settings
                 .active_mode_features
@@ -531,55 +857,123 @@ impl GuiApp {
                 .unwrap_or_else(|| self.settings.features.clone())
         } else {
             let choices = self.settings.features.clone();
+            let previous_pending_resolution = self.settings.pending_resolution;
+            self.settings.gaming_mode_active = true;
             self.settings.active_mode_features = Some(choices.clone());
+            self.settings.taskbar_auto_hide_before_activation = choices
+                .taskbar_auto_hide
+                .then(app::taskbar_auto_hide_enabled);
+            self.settings.pending_resolution = self
+                .settings
+                .gaming_resolution
+                .map(PendingResolution::gaming);
+
+            // Commit a synchronous recovery record before changing Windows. A
+            // crash at any later point can then be repaired or retried.
+            if let Err(error) = self.persist_mode_state(frame) {
+                self.settings.gaming_mode_active = false;
+                self.settings.active_mode_features = None;
+                self.settings.taskbar_auto_hide_before_activation = None;
+                self.settings.pending_resolution = previous_pending_resolution;
+                self.errors.push(format!(
+                    "Gaming Mode was not activated because its recovery state could not be saved: {error}"
+                ));
+                self.begin_fixed_size_settle(context);
+                return;
+            }
             choices
         };
 
-        let report = app::toggle(choices.toggle_options());
-        let transition_succeeded = report.gaming_mode_enabled != was_enabled;
-        self.restore_actions_failed =
-            was_enabled && report.gaming_mode_enabled && report.optional_actions_failed;
-
-        if report.gaming_mode_enabled {
-            self.settings.active_mode_features = Some(choices);
+        let report = if was_enabled {
+            app::restore(
+                choices.toggle_options(),
+                self.settings.taskbar_auto_hide_before_activation,
+            )
         } else {
-            self.settings.active_mode_features = None;
-        }
+            app::activate(choices.toggle_options())
+        };
 
         let mut errors = report.errors;
-        if !transition_succeeded {
-            if self.restore_actions_failed {
-                errors.push(
-                    "Uncheck a failing action if Windows cannot restore it, then retry.".to_owned(),
-                );
-            } else if errors.is_empty() {
-                errors.push("Windows did not change the main mode.".to_owned());
+        self.restore_actions_failed = was_enabled && !errors.is_empty();
+        if self.restore_actions_failed {
+            self.settings.active_mode_features = Some(choices.clone());
+            errors.push(
+                "Uncheck a failing action if Windows cannot restore it, then retry.".to_owned(),
+            );
+            if let Some(pending) = self.settings.pending_resolution {
+                let target = pending.target;
+                self.pending_resolution = Some((
+                    pending,
+                    format!("The saved resolution change to {target} still needs to be retried."),
+                ));
             }
         } else {
-            let target = if report.gaming_mode_enabled {
-                self.settings.gaming_resolution
-            } else {
-                self.settings.desktop_resolution
-            };
+            if was_enabled {
+                let original_taskbar_auto_hide = self.settings.taskbar_auto_hide_before_activation;
+                let previous_pending_resolution = self.settings.pending_resolution;
+                self.settings.gaming_mode_active = false;
+                self.settings.active_mode_features = None;
+                self.settings.taskbar_auto_hide_before_activation = None;
+                self.settings.pending_resolution = self
+                    .settings
+                    .desktop_resolution
+                    .map(PendingResolution::desktop);
 
-            if let Some(target) = target
-                && let Err(error) = self.apply_profile_resolution(target)
-            {
-                self.pending_resolution = Some((target, error));
+                // Windows actions are restored, but the app remains logically
+                // active until the Desktop state is durably committed.
+                if let Err(error) = self.persist_mode_state(frame) {
+                    self.settings.gaming_mode_active = true;
+                    self.settings.active_mode_features = Some(choices.clone());
+                    self.settings.taskbar_auto_hide_before_activation = original_taskbar_auto_hide;
+                    self.settings.pending_resolution = previous_pending_resolution;
+                    self.restore_actions_failed = true;
+                    errors.push(format!(
+                        "Windows was restored, but Desktop Mode could not be saved. Retry the restore: {error}"
+                    ));
+                }
+            }
+
+            if self.settings.gaming_mode_active != was_enabled {
+                self.apply_pending_resolution();
             }
         }
 
-        #[cfg(feature = "sound")]
         if self.settings.sounds_enabled
-            && let Some(cue) = sound::transition_cue(was_enabled, report.gaming_mode_enabled)
+            && let Some(cue) = sound::transition_cue(was_enabled, self.settings.gaming_mode_active)
         {
             self.sound_player.play(cue);
         }
 
         self.errors = errors;
+        if let Err(error) = self.persist_mode_state(frame) {
+            push_unique_error(
+                &mut self.errors,
+                format!("Could not update the persistent mode state: {error}"),
+            );
+        }
         // ChangeDisplaySettingsW can synchronously alter the viewport placement.
         // Reassert the immutable dimensions now and again after Windows settles.
         self.begin_fixed_size_settle(context);
+    }
+
+    fn persist_mode_state(&self, frame: &mut eframe::Frame) -> Result<(), String> {
+        save_durable_mode_state(&DurableModeState::from_settings(&self.settings))?;
+        if let Some(storage) = frame.storage_mut() {
+            store_settings(storage, &self.settings);
+            storage.flush();
+        }
+        Ok(())
+    }
+
+    fn apply_pending_resolution(&mut self) {
+        let Some(pending) = self.settings.pending_resolution else {
+            return;
+        };
+        let target = pending.target;
+        match self.apply_profile_resolution(target) {
+            Ok(()) => self.settings.pending_resolution = None,
+            Err(error) => self.pending_resolution = Some((pending, error)),
+        }
     }
 
     fn begin_fixed_size_settle(&mut self, context: &egui::Context) {
@@ -609,23 +1003,20 @@ impl GuiApp {
 
         self.errors.clear();
         self.pending_resolution = None;
-        let gaming_mode = app::gaming_mode_enabled();
+        let gaming_mode = self.settings.gaming_mode_active;
         self.mode_transition = Some(if gaming_mode {
             ModeTransitionState::RestorePressed(now)
         } else {
             ModeTransitionState::EnterPressed(now)
         });
-        #[cfg(feature = "sound")]
-        {
-            self.last_countdown_digit = None;
-            if self.settings.sounds_enabled {
-                if gaming_mode {
-                    self.sound_player.warm_up();
-                } else if self.sound_player.prepare_countdown() {
-                    // Digit 3 is already queued directly after the silent
-                    // click-animation lead-in on the persistent output handle.
-                    self.last_countdown_digit = Some(3);
-                }
+        self.last_countdown_digit = None;
+        if self.settings.sounds_enabled {
+            if gaming_mode {
+                self.sound_player.warm_up();
+            } else if self.sound_player.prepare_countdown() {
+                // Digit 3 is already queued directly after the silent
+                // click-animation lead-in on the persistent output handle.
+                self.last_countdown_digit = Some(3);
             }
         }
         context.request_repaint();
@@ -633,13 +1024,9 @@ impl GuiApp {
 
     fn clear_mode_transition(&mut self) {
         self.mode_transition = None;
-        #[cfg(feature = "sound")]
-        {
-            self.last_countdown_digit = None;
-        }
+        self.last_countdown_digit = None;
     }
 
-    #[cfg(feature = "sound")]
     fn sync_countdown_sound(&mut self, digit: u8) {
         if mark_countdown_digit(&mut self.last_countdown_digit, digit)
             && self.settings.sounds_enabled
@@ -697,6 +1084,26 @@ impl GuiApp {
         self.tray_mode_item.set_text(label);
         self.tray_mode_item.set_enabled(enabled);
         self.tray_menu_state = state;
+    }
+
+    fn sync_tray_gaming_options(&mut self) {
+        let presentation = gaming_options_presentation(&self.settings);
+        if presentation.menu_items == self.tray_gaming_option_labels {
+            return;
+        }
+
+        debug_assert_eq!(
+            self.tray_gaming_option_items.len(),
+            presentation.menu_items.len()
+        );
+        for (item, label) in self
+            .tray_gaming_option_items
+            .iter()
+            .zip(&presentation.menu_items)
+        {
+            item.set_text(label);
+        }
+        self.tray_gaming_option_labels = presentation.menu_items;
     }
 
     fn apply_profile_resolution(&self, target: Resolution) -> Result<(), String> {
@@ -812,60 +1219,44 @@ impl GuiApp {
         }
     }
 
-    fn show_feature_choices(&mut self, ui: &mut egui::Ui, gaming_mode: bool) {
-        #[cfg(not(any(
-            feature = "desktop-icons",
-            feature = "desktop-background",
-            feature = "minimize-all-windows"
-        )))]
-        let _ = gaming_mode;
+    fn show_gaming_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        gaming_mode: bool,
+        frame: &mut eframe::Frame,
+    ) {
+        let previous_gaming_resolution = self.settings.gaming_resolution;
+        let resolutions = self.display.resolutions.clone();
+        let available_resolutions = self.display.available_resolutions.clone();
+        let native_resolution = self.display.native;
 
         card(ui, |ui| {
             ui.label(RichText::new("Gaming mode options").size(15.0).strong());
             ui.add_space(4.0);
 
-            #[cfg(not(any(
-                feature = "desktop-icons",
-                feature = "desktop-background",
-                feature = "minimize-all-windows"
-            )))]
-            ui.label(
-                RichText::new("Taskbar auto-hide is the only mode action in this build.")
-                    .size(13.0)
-                    .color(TEXT_MUTED),
-            );
-
-            #[cfg(any(
-                feature = "desktop-icons",
-                feature = "desktop-background",
-                feature = "minimize-all-windows"
-            ))]
             ui.add_enabled_ui(!gaming_mode || self.restore_actions_failed, |ui| {
-                #[cfg(feature = "desktop-icons")]
+                accent_checkbox(
+                    ui,
+                    &mut self.settings.features.taskbar_auto_hide,
+                    "Auto-hide the taskbar",
+                );
                 accent_checkbox(
                     ui,
                     &mut self.settings.features.desktop_icons,
                     "Hide desktop icons",
                 );
-                #[cfg(feature = "desktop-background")]
                 accent_checkbox(
                     ui,
                     &mut self.settings.features.desktop_background,
                     "Use a solid black desktop background",
                 );
-                #[cfg(feature = "minimize-all-windows")]
                 accent_checkbox(
                     ui,
                     &mut self.settings.features.minimize_all_windows,
-                    "Minimize open windows when entering",
+                    "Minimize open windows",
                 );
             });
 
-            #[cfg(any(
-                feature = "desktop-icons",
-                feature = "desktop-background",
-                feature = "minimize-all-windows"
-            ))]
             if gaming_mode && self.restore_actions_failed {
                 ui.add_space(3.0);
                 ui.label(
@@ -875,87 +1266,30 @@ impl GuiApp {
                 );
             }
 
-            #[cfg(any(
-                feature = "desktop-icons",
-                feature = "desktop-background",
-                feature = "minimize-all-windows"
-            ))]
             if gaming_mode && self.restore_actions_failed {
                 self.settings.active_mode_features = Some(self.settings.features.clone());
             }
-        });
-    }
 
-    fn show_resolution_profiles(&mut self, ui: &mut egui::Ui) {
-        let previous_desktop = self.settings.desktop_resolution;
-        let previous_gaming = self.settings.gaming_resolution;
-        let resolutions = self.display.resolutions.clone();
-        let available_resolutions = self.display.available_resolutions.clone();
-        let native = self.display.native;
-
-        card(ui, |ui| {
-            ui.label(RichText::new("Resolution profiles").size(15.0).strong());
-            ui.label(
-                RichText::new("Applied only when switching modes.")
-                    .size(12.0)
-                    .color(TEXT_MUTED),
+            ui.add_space(4.0);
+            gaming_resolution_combo_box(
+                ui,
+                &resolutions,
+                &available_resolutions,
+                native_resolution,
+                &mut self.settings.gaming_resolution,
             );
-            ui.add_space(7.0);
-
-            if resolutions.is_empty() {
-                ui.label(
-                    RichText::new("No primary-monitor resolutions are available.")
-                        .color(Color32::from_rgb(248, 113, 113)),
-                );
-            } else if ui.available_width() >= 360.0 {
-                ui.columns(2, |columns| {
-                    resolution_profile_list(
-                        &mut columns[0],
-                        "Desktop mode",
-                        "desktop-resolution-list",
-                        &resolutions,
-                        &available_resolutions,
-                        native,
-                        &mut self.settings.desktop_resolution,
-                    );
-                    resolution_profile_list(
-                        &mut columns[1],
-                        "Gaming mode",
-                        "gaming-resolution-list",
-                        &resolutions,
-                        &available_resolutions,
-                        native,
-                        &mut self.settings.gaming_resolution,
-                    );
-                });
-            } else {
-                resolution_profile_list(
-                    ui,
-                    "Desktop mode",
-                    "desktop-resolution-list-compact",
-                    &resolutions,
-                    &available_resolutions,
-                    native,
-                    &mut self.settings.desktop_resolution,
-                );
-                ui.add_space(10.0);
-                resolution_profile_list(
-                    ui,
-                    "Gaming mode",
-                    "gaming-resolution-list-compact",
-                    &resolutions,
-                    &available_resolutions,
-                    native,
-                    &mut self.settings.gaming_resolution,
-                );
-            }
         });
 
-        if self.settings.desktop_resolution != previous_desktop
-            || self.settings.gaming_resolution != previous_gaming
-        {
+        if self.settings.gaming_resolution != previous_gaming_resolution {
             self.errors.clear();
-            self.pending_resolution = None;
+            if cancel_pending_gaming_resolution(&mut self.settings.pending_resolution) {
+                self.pending_resolution = None;
+            }
+            if let Err(error) = self.persist_mode_state(frame) {
+                self.errors.push(format!(
+                    "Could not save the updated Gaming resolution: {error}"
+                ));
+            }
         }
     }
 
@@ -997,7 +1331,6 @@ impl GuiApp {
                 }
             }
 
-            #[cfg(feature = "sound")]
             accent_checkbox(ui, &mut self.settings.sounds_enabled, "Enable sounds");
 
             let previous_transparency = self.settings.window_transparency;
@@ -1015,13 +1348,13 @@ impl GuiApp {
                     self.settings.window_transparency = previous_transparency;
                     push_unique_error(&mut self.errors, error);
                 } else {
-                    remove_errors_containing(&mut self.errors, "window transparency");
+                    remove_errors_containing(&mut self.errors, "transparency");
                 }
             }
         });
     }
 
-    fn show_errors(&mut self, ui: &mut egui::Ui) {
+    fn show_errors(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if !self.errors.is_empty() {
             ui.horizontal_top(|ui| {
                 ui.label(
@@ -1040,7 +1373,8 @@ impl GuiApp {
             });
         }
 
-        if let Some((target, error)) = self.pending_resolution.clone() {
+        if let Some((pending, error)) = self.pending_resolution.clone() {
+            let target = pending.target;
             if !self.errors.is_empty() {
                 ui.add_space(5.0);
             }
@@ -1069,10 +1403,25 @@ impl GuiApp {
             )
             .clicked()
             {
-                self.pending_resolution = self
-                    .apply_profile_resolution(target)
-                    .err()
-                    .map(|error| (target, error));
+                match self.apply_profile_resolution(target) {
+                    Ok(()) => {
+                        self.settings.pending_resolution = None;
+                        self.pending_resolution = None;
+                        if let Err(error) = self.persist_mode_state(frame) {
+                            self.settings.pending_resolution = Some(pending);
+                            self.pending_resolution = Some((
+                                pending,
+                                format!(
+                                    "The resolution was applied, but its completion could not be saved: {error}"
+                                ),
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        self.settings.pending_resolution = Some(pending);
+                        self.pending_resolution = Some((pending, error));
+                    }
+                }
                 self.begin_fixed_size_settle(ui.ctx());
             }
         }
@@ -1184,12 +1533,18 @@ fn configure_context(context: &egui::Context) {
 }
 
 impl eframe::App for GuiApp {
-    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        self.reapply_window_transparency_after_show(context, frame);
+
         let now = context.input(|input| input.time);
 
         while let Ok(command) = self.tray_commands.try_recv() {
             match command {
                 TrayCommand::Open => {
+                    // winit rewrites the extended window style while applying
+                    // Visible(true), which removes WS_EX_LAYERED. Repair it on
+                    // the following visible frame just as we do at startup.
+                    self.window_transparency_reapply_pending = true;
                     context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     context.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                     context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1205,7 +1560,7 @@ impl eframe::App for GuiApp {
             }
         }
 
-        let mut gaming_mode = app::gaming_mode_enabled();
+        let mut gaming_mode = self.settings.gaming_mode_active;
 
         if let Some(transition) = self.mode_transition {
             match (gaming_mode, transition) {
@@ -1213,7 +1568,6 @@ impl eframe::App for GuiApp {
                     if mode_button_click_animation_finished(clicked_at, now) =>
                 {
                     self.mode_transition = Some(ModeTransitionState::Countdown(now));
-                    #[cfg(feature = "sound")]
                     self.sync_countdown_sound(3);
                     context.request_repaint();
                 }
@@ -1229,14 +1583,13 @@ impl eframe::App for GuiApp {
                     context.request_repaint();
                 }
                 (false, ModeTransitionState::Countdown(_started_at)) => {
-                    #[cfg(feature = "sound")]
                     self.sync_countdown_sound(countdown_digit(_started_at, now));
                     context.request_repaint_after(Duration::from_millis(16));
                 }
                 (false, ModeTransitionState::ApplyingGaming(_)) => {
                     self.clear_mode_transition();
-                    self.toggle_mode(context);
-                    gaming_mode = app::gaming_mode_enabled();
+                    self.toggle_mode(context, frame);
+                    gaming_mode = self.settings.gaming_mode_active;
                 }
                 (true, ModeTransitionState::RestorePressed(clicked_at))
                     if mode_button_click_animation_finished(clicked_at, now) =>
@@ -1251,10 +1604,10 @@ impl eframe::App for GuiApp {
                 }
                 (true, ModeTransitionState::ApplyingDesktop(_)) => {
                     self.clear_mode_transition();
-                    self.toggle_mode(context);
-                    gaming_mode = app::gaming_mode_enabled();
+                    self.toggle_mode(context, frame);
+                    gaming_mode = self.settings.gaming_mode_active;
                 }
-                // The OS mode changed outside this pending transition.
+                // A stale transition no longer matches the persisted mode.
                 _ => self.clear_mode_transition(),
             }
         }
@@ -1263,6 +1616,7 @@ impl eframe::App for GuiApp {
         let tray_icon_state = self.desired_tray_icon_state(state, now);
         self.sync_tray_icon(tray_icon_state);
         self.sync_tray_menu(state);
+        self.sync_tray_gaming_options();
 
         if self.fixed_size_settle_passes > 0 {
             request_fixed_window_size(context);
@@ -1287,12 +1641,9 @@ impl eframe::App for GuiApp {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.request_close_to_tray(context);
         }
-
-        // Keep the LED accurate if taskbar auto-hide is changed outside this app.
-        context.request_repaint_after(Duration::from_secs(1));
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Register this before the controls so they keep interaction priority
         // over the full-window drag surface.
         let drag_response = ui.interact(
@@ -1304,7 +1655,7 @@ impl eframe::App for GuiApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        let gaming_mode = app::gaming_mode_enabled();
+        let gaming_mode = self.settings.gaming_mode_active;
         let state = self.visual_state(gaming_mode, ui.input(|input| input.time));
 
         egui::CentralPanel::default()
@@ -1331,12 +1682,10 @@ impl eframe::App for GuiApp {
                         self.show_mode_button(ui, state);
                         if !self.errors.is_empty() || self.pending_resolution.is_some() {
                             ui.add_space(9.0);
-                            self.show_errors(ui);
+                            self.show_errors(ui, frame);
                         }
                         ui.add_space(9.0);
-                        self.show_feature_choices(ui, gaming_mode);
-                        ui.add_space(9.0);
-                        self.show_resolution_profiles(ui);
+                        self.show_gaming_options(ui, gaming_mode, frame);
                         ui.add_space(9.0);
                         self.show_application_behavior(ui);
                     });
@@ -1351,11 +1700,7 @@ impl eframe::App for GuiApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        // Migrate away from eframe's native geometry/UI persistence. These keys
-        // may contain the 160x64 iconic size and its associated scroll state.
-        storage.remove_string(EFRAME_WINDOW_STORAGE_KEY);
-        storage.remove_string(EFRAME_MEMORY_STORAGE_KEY);
-        eframe::set_value(storage, STORAGE_KEY, &self.settings);
+        store_settings(storage, &self.settings);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -1367,8 +1712,16 @@ impl eframe::App for GuiApp {
     }
 }
 
-fn native_window_handle(creation_context: &eframe::CreationContext<'_>) -> Option<HWND> {
-    match creation_context.window_handle().ok()?.as_raw() {
+fn store_settings(storage: &mut dyn eframe::Storage, settings: &Settings) {
+    // Migrate away from eframe's native geometry/UI persistence. These keys
+    // may contain the 160x64 iconic size and its associated scroll state.
+    storage.remove_string(EFRAME_WINDOW_STORAGE_KEY);
+    storage.remove_string(EFRAME_MEMORY_STORAGE_KEY);
+    eframe::set_value(storage, STORAGE_KEY, settings);
+}
+
+fn native_window_handle(window: &impl raw_window_handle::HasWindowHandle) -> Option<HWND> {
+    match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut _)),
         _ => None,
     }
@@ -1443,23 +1796,38 @@ fn create_tray(
     context: &egui::Context,
     icon_state: TrayIconState,
     mode_state: ModeVisualState,
-) -> Result<(TrayIcon, MenuItem, Receiver<TrayCommand>), Box<dyn Error + Send + Sync>> {
+    gaming_options: &GamingOptionsPresentation,
+) -> Result<(TrayIcon, TrayMenuItems, Receiver<TrayCommand>), Box<dyn Error + Send + Sync>> {
     let menu = Menu::new();
     let open_item = MenuItem::new("Open", true, None);
     let (mode_label, mode_enabled) = tray_mode_menu_presentation(mode_state);
     let mode_item = MenuItem::new(mode_label, mode_enabled, None);
     let open_separator = PredefinedMenuItem::separator();
+    let options_separator = PredefinedMenuItem::separator();
+    let options_heading = MenuItem::new("Gaming mode options", false, None);
+    let option_items = gaming_options
+        .menu_items
+        .iter()
+        .map(|label| MenuItem::new(label, false, None))
+        .collect::<Vec<_>>();
     let quit_separator = PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("Quit", true, None);
-    menu.append_items(&[
-        &open_item,
-        &open_separator,
-        &mode_item,
-        &quit_separator,
-        &quit_item,
-    ])?;
+    menu.append(&open_item)?;
+    menu.append(&open_separator)?;
+    menu.append(&mode_item)?;
+    menu.append(&options_separator)?;
+    menu.append(&options_heading)?;
+    for item in &option_items {
+        menu.append(item)?;
+    }
+    menu.append(&quit_separator)?;
+    menu.append(&quit_item)?;
     unsafe {
-        SetMenuDefaultItem(HMENU(menu.hpopupmenu() as *mut core::ffi::c_void), 0, 1)?;
+        SetMenuDefaultItem(
+            HMENU(menu.hpopupmenu() as *mut core::ffi::c_void),
+            TRAY_MODE_MENU_POSITION,
+            1,
+        )?;
     }
 
     let tray_icon = TrayIconBuilder::new()
@@ -1503,12 +1871,51 @@ fn create_tray(
                 ..
             }
         ) {
-            let _ = sender.send(TrayCommand::Open);
+            let _ = sender.send(tray_default_command());
             tray_context.request_repaint();
         }
     }));
 
-    Ok((tray_icon, mode_item, receiver))
+    Ok((
+        tray_icon,
+        TrayMenuItems {
+            mode: mode_item,
+            gaming_options: option_items,
+        },
+        receiver,
+    ))
+}
+
+fn gaming_options_presentation(settings: &Settings) -> GamingOptionsPresentation {
+    let resolution = settings.gaming_resolution.map_or_else(
+        || "Unavailable".to_owned(),
+        |resolution| resolution.to_string(),
+    );
+    let menu_items = vec![
+        format!("Resolution: {resolution}"),
+        format!(
+            "Taskbar auto-hide: {}",
+            on_off(settings.features.taskbar_auto_hide)
+        ),
+        format!(
+            "Hide desktop icons: {}",
+            on_off(settings.features.desktop_icons)
+        ),
+        format!(
+            "Black desktop background: {}",
+            on_off(settings.features.desktop_background)
+        ),
+        format!(
+            "Minimize open windows: {}",
+            on_off(settings.features.minimize_all_windows)
+        ),
+    ];
+
+    GamingOptionsPresentation { menu_items }
+}
+
+const fn on_off(enabled: bool) -> &'static str {
+    if enabled { "On" } else { "Off" }
 }
 
 fn tray_status_icon(state: TrayIconState) -> Result<Icon, Box<dyn Error + Send + Sync>> {
@@ -1527,56 +1934,143 @@ fn tray_status_icon(state: TrayIconState) -> Result<Icon, Box<dyn Error + Send +
     Ok(Icon::from_rgba(image.into_raw(), width, height)?)
 }
 
-fn resolution_profile_list(
+fn gaming_resolution_combo_box(
     ui: &mut egui::Ui,
-    title: &str,
-    id: &str,
     resolutions: &[Resolution],
     available_resolutions: &[Resolution],
     native: Option<Resolution>,
     selection: &mut Option<Resolution>,
 ) {
-    ui.label(RichText::new(title).size(13.0).strong());
+    ui.label(RichText::new("Resolution").size(13.0).strong());
     ui.add_space(3.0);
 
-    Frame::new()
-        .fill(BACKGROUND.gamma_multiply(0.72))
-        .stroke(Stroke::new(1.0, CARD_BORDER.gamma_multiply(0.75)))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(4))
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(id)
-                .max_height(98.0)
-                .min_scrolled_height(98.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for resolution in resolutions.iter().copied() {
-                        let available = available_resolutions.contains(&resolution);
-                        let label = if native == Some(resolution) {
-                            format!("{resolution} (native)")
-                        } else if !available {
-                            format!("{resolution} (unavailable)")
-                        } else {
-                            resolution.to_string()
-                        };
-                        let selected = *selection == Some(resolution);
-                        let mut response = ui
-                            .push_id((id, resolution), |ui| {
-                                ui.add_enabled_ui(available, |ui| {
-                                    animated_selectable_row(ui, &label, selected)
-                                })
-                                .inner
-                            })
-                            .inner;
+    if resolutions.is_empty() {
+        Frame::new()
+            .fill(Color32::from_rgb(14, 18, 28))
+            .stroke(Stroke::new(1.0, CARD_BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("No primary-monitor modes available")
+                        .size(12.5)
+                        .color(Color32::from_rgb(248, 113, 113)),
+                );
+            });
+        return;
+    }
 
-                        if response.clicked() {
-                            *selection = Some(resolution);
-                            response.mark_changed();
-                        }
-                    }
-                });
-        });
+    let selected_text = selection.map_or_else(
+        || "Select a resolution".to_owned(),
+        |resolution| {
+            resolution_picker_label(
+                resolution,
+                available_resolutions.contains(&resolution),
+                native,
+            )
+        },
+    );
+
+    ui.scope(|ui| {
+        style_resolution_combo(ui);
+        egui::ComboBox::from_id_salt("gaming-resolution-combo")
+            .width(ui.available_width())
+            .selected_text(
+                RichText::new(selected_text)
+                    .size(13.5)
+                    .color(Color32::WHITE),
+            )
+            .popup_style(resolution_combo_popup_style())
+            .icon(|ui, rect, visuals, is_open| {
+                let half_width = rect.width() * 0.32;
+                let half_height = rect.height() * 0.18;
+                let center = rect.center();
+                let stroke = Stroke::new(
+                    1.7,
+                    if is_open {
+                        ACCENT_HOVER
+                    } else {
+                        visuals.fg_stroke.color
+                    },
+                );
+                let points = if is_open {
+                    [
+                        center + Vec2::new(-half_width, half_height),
+                        center + Vec2::new(0.0, -half_height),
+                        center + Vec2::new(half_width, half_height),
+                    ]
+                } else {
+                    [
+                        center + Vec2::new(-half_width, -half_height),
+                        center + Vec2::new(0.0, half_height),
+                        center + Vec2::new(half_width, -half_height),
+                    ]
+                };
+                ui.painter().line_segment([points[0], points[1]], stroke);
+                ui.painter().line_segment([points[1], points[2]], stroke);
+            })
+            .show_ui(ui, |ui| {
+                for resolution in resolutions.iter().copied() {
+                    let available = available_resolutions.contains(&resolution);
+                    let label = resolution_picker_label(resolution, available, native);
+                    ui.add_enabled_ui(available, |ui| {
+                        ui.selectable_value(selection, Some(resolution), label);
+                    });
+                }
+            });
+    });
+}
+
+fn style_resolution_combo(ui: &mut egui::Ui) {
+    ui.spacing_mut().button_padding = Vec2::new(12.0, 8.0);
+    let widgets = &mut ui.visuals_mut().widgets;
+
+    widgets.inactive.weak_bg_fill = Color32::from_rgb(14, 18, 28);
+    widgets.inactive.bg_stroke = Stroke::new(1.0, CARD_BORDER);
+    widgets.inactive.corner_radius = CornerRadius::same(8);
+    widgets.inactive.fg_stroke = Stroke::new(1.2, TEXT_MUTED);
+
+    widgets.hovered.weak_bg_fill = Color32::from_rgb(29, 33, 50);
+    widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+    widgets.hovered.corner_radius = CornerRadius::same(8);
+    widgets.hovered.fg_stroke = Stroke::new(1.4, Color32::WHITE);
+
+    widgets.active.weak_bg_fill = Color32::from_rgb(39, 34, 79);
+    widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_HOVER);
+    widgets.active.corner_radius = CornerRadius::same(8);
+    widgets.active.fg_stroke = Stroke::new(1.4, Color32::WHITE);
+
+    widgets.open = widgets.active;
+}
+
+fn resolution_combo_popup_style() -> egui::style::StyleModifier {
+    egui::style::StyleModifier::new(|style| {
+        style.spacing.item_spacing.y = 3.0;
+        style.visuals.window_fill = Color32::from_rgb(14, 18, 28);
+        style.visuals.window_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.72));
+        style.visuals.menu_corner_radius = CornerRadius::same(8);
+        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(39, 34, 79);
+        style.visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
+        style.visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 41, 99);
+        style.visuals.widgets.active.corner_radius = CornerRadius::same(6);
+        style.visuals.selection.bg_fill = ACCENT.gamma_multiply(0.72);
+        style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    })
+}
+
+fn resolution_picker_label(
+    resolution: Resolution,
+    available: bool,
+    native: Option<Resolution>,
+) -> String {
+    if native == Some(resolution) {
+        format!("{resolution} (native)")
+    } else if !available {
+        format!("{resolution} (unavailable)")
+    } else {
+        resolution.to_string()
+    }
 }
 
 fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -1994,67 +2488,6 @@ fn window_version_label(context: &egui::Context) {
         });
 }
 
-fn animated_selectable_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), egui::Sense::click());
-    response
-        .widget_info(|| WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, label));
-
-    if ui.is_rect_visible(rect) {
-        let selected_t =
-            ui.ctx()
-                .animate_bool_with_time(response.id.with("selected"), selected, 0.18);
-        let hover_t =
-            ui.ctx()
-                .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.15);
-        let press_t = ui.ctx().animate_bool_with_time(
-            response.id.with("press"),
-            response.is_pointer_button_down_on(),
-            0.10,
-        );
-        let enabled_alpha = if ui.is_enabled() {
-            1.0
-        } else {
-            ui.visuals().disabled_alpha()
-        };
-        let painter = ui.painter().with_clip_rect(rect);
-        let base_fill = Color32::from_rgba_unmultiplied(50, 58, 78, (44.0 * hover_t) as u8);
-        let selected_fill = Color32::from_rgba_unmultiplied(
-            112,
-            98,
-            255,
-            (150.0 * selected_t * enabled_alpha) as u8,
-        );
-        painter.rect_filled(
-            rect.shrink(press_t * 0.7),
-            CornerRadius::same(6),
-            mix_color(base_fill, selected_fill, selected_t),
-        );
-        if selected_t > 0.0 {
-            let rail = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 2.0, rect.center().y),
-                Vec2::new(3.0, (rect.height() - 8.0) * selected_t),
-            );
-            painter.rect_filled(
-                rail,
-                CornerRadius::same(2),
-                ACCENT_HOVER.gamma_multiply(enabled_alpha),
-            );
-        }
-        let text_color =
-            mix_color(TEXT_MUTED, Color32::WHITE, selected_t).gamma_multiply(enabled_alpha);
-        painter.text(
-            egui::pos2(rect.left() + 9.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::new(12.5, FontFamily::Proportional),
-            text_color,
-        );
-    }
-
-    response
-}
-
 fn countdown_digit(started_at: f64, now: f64) -> u8 {
     (3_i32 - (now - started_at).max(0.0).floor() as i32).clamp(1, 3) as u8
 }
@@ -2067,7 +2500,6 @@ fn mode_button_click_animation_finished(clicked_at: f64, now: f64) -> bool {
     now - clicked_at >= MODE_BUTTON_CLICK_ANIMATION_SECONDS
 }
 
-#[cfg(feature = "sound")]
 fn mark_countdown_digit(last_digit: &mut Option<u8>, digit: u8) -> bool {
     if *last_digit == Some(digit) {
         return false;
@@ -2088,8 +2520,8 @@ fn activating_tray_icon_state(elapsed: f64) -> TrayIconState {
 
 fn tray_mode_menu_presentation(state: ModeVisualState) -> (String, bool) {
     match state {
-        ModeVisualState::Desktop => ("Enter Gaming Mode".to_owned(), true),
-        ModeVisualState::EnterPressed => ("Enter Gaming Mode".to_owned(), false),
+        ModeVisualState::Desktop => ("Activate Gaming Mode".to_owned(), true),
+        ModeVisualState::EnterPressed => ("Activate Gaming Mode".to_owned(), false),
         ModeVisualState::Countdown(countdown) => (format!("Activating in {countdown}…"), false),
         ModeVisualState::Activating => ("Activating…".to_owned(), false),
         ModeVisualState::Gaming => ("Restore Desktop Mode".to_owned(), true),
@@ -2098,10 +2530,14 @@ fn tray_mode_menu_presentation(state: ModeVisualState) -> (String, bool) {
     }
 }
 
+const fn tray_default_command() -> TrayCommand {
+    TrayCommand::ToggleMode
+}
+
 fn mode_button_presentation(state: ModeVisualState) -> (String, bool) {
     match state {
         ModeVisualState::Desktop | ModeVisualState::EnterPressed => {
-            ("Enter gaming mode".to_owned(), false)
+            ("Activate gaming mode".to_owned(), false)
         }
         ModeVisualState::Countdown(countdown) => (format!("Activating in {countdown}"), true),
         ModeVisualState::Activating => ("Activating...".to_owned(), false),
@@ -2132,9 +2568,29 @@ fn color_with_alpha(color: Color32, alpha: u8) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::Storage as _;
+
+    #[derive(Default)]
+    struct MemoryStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     #[test]
-    fn missing_profiles_default_to_the_current_resolution() {
+    fn missing_desktop_profile_captures_the_current_resolution_on_first_start() {
         let mut profile = None;
 
         initialize_profile(&mut profile, Resolution::new(1920, 1080));
@@ -2143,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_profiles_are_preserved_when_temporarily_unavailable() {
+    fn captured_desktop_profile_is_not_overwritten_on_later_starts() {
         let current = Resolution::new(1920, 1080);
         let saved = Resolution::new(2560, 1440);
         let mut profile = Some(saved);
@@ -2163,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn disallowed_saved_profile_is_replaced_by_the_allowed_default() {
+    fn disallowed_saved_gaming_profile_is_replaced_by_the_allowed_default() {
         let native = Some(Resolution::new(2560, 1440));
         let default = Resolution::new(1920, 1080);
         let mut profile = Some(Resolution::new(2560, 1600));
@@ -2171,6 +2627,48 @@ mod tests {
         replace_disallowed_profile(&mut profile, default, native);
 
         assert_eq!(profile, Some(default));
+    }
+
+    #[test]
+    fn resolution_picker_labels_native_and_unavailable_modes() {
+        let native = Resolution::new(5120, 1440);
+
+        assert_eq!(
+            resolution_picker_label(native, true, Some(native)),
+            "5120 × 1440 (native)"
+        );
+        assert_eq!(
+            resolution_picker_label(Resolution::new(3440, 1440), true, Some(native)),
+            "3440 × 1440"
+        );
+        assert_eq!(
+            resolution_picker_label(Resolution::new(2560, 1080), false, Some(native)),
+            "2560 × 1080 (unavailable)"
+        );
+    }
+
+    #[test]
+    fn gaming_resolution_combo_is_stacked_below_its_label() {
+        let context = egui::Context::default();
+        configure_context(&context);
+        let resolutions = [Resolution::new(5120, 1440), Resolution::new(3440, 1440)];
+        let mut selection = Some(resolutions[0]);
+        let mut control_height = 0.0;
+
+        let _output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_width(440.0);
+            let top = ui.cursor().top();
+            gaming_resolution_combo_box(
+                ui,
+                &resolutions,
+                &resolutions,
+                Some(resolutions[0]),
+                &mut selection,
+            );
+            control_height = ui.cursor().top() - top;
+        });
+
+        assert_eq!(control_height, 66.0);
     }
 
     #[test]
@@ -2192,14 +2690,12 @@ mod tests {
 
         assert!(!mode_button_click_animation_finished(clicked_at, 10.159));
         assert!(mode_button_click_animation_finished(clicked_at, 10.160));
-        #[cfg(feature = "sound")]
         assert_eq!(
             MODE_BUTTON_CLICK_ANIMATION_SECONDS,
             crate::sound::WARM_UP_MILLISECONDS as f64 / 1_000.0
         );
     }
 
-    #[cfg(feature = "sound")]
     #[test]
     fn countdown_sound_plays_once_per_visible_digit() {
         let mut last_digit = None;
@@ -2215,10 +2711,216 @@ mod tests {
         assert!(mark_countdown_digit(&mut last_digit, 3));
     }
 
-    #[cfg(feature = "sound")]
     #[test]
     fn sounds_are_enabled_by_default() {
         assert!(Settings::default().sounds_enabled);
+    }
+
+    #[test]
+    fn taskbar_auto_hide_is_enabled_by_default() {
+        assert!(Settings::default().features.taskbar_auto_hide);
+    }
+
+    #[test]
+    fn legacy_gaming_mode_migrates_to_persisted_state() {
+        let mut settings = Settings {
+            settings_version: 0,
+            active_mode_features: None,
+            ..Settings::default()
+        };
+
+        migrate_settings(&mut settings, true);
+
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert!(settings.gaming_mode_active);
+        assert!(settings.active_mode_features.is_some());
+        assert_eq!(settings.taskbar_auto_hide_before_activation, Some(false));
+    }
+
+    #[test]
+    fn legacy_taskbar_state_wins_over_a_stale_action_snapshot() {
+        let mut settings = Settings {
+            settings_version: 0,
+            active_mode_features: Some(FeatureChoices::default()),
+            taskbar_auto_hide_before_activation: Some(false),
+            ..Settings::default()
+        };
+
+        migrate_settings(&mut settings, false);
+
+        assert!(!settings.gaming_mode_active);
+        assert!(settings.active_mode_features.is_none());
+        assert_eq!(settings.taskbar_auto_hide_before_activation, None);
+    }
+
+    #[test]
+    fn settings_without_a_version_are_detected_as_legacy() {
+        let mut storage = MemoryStorage::default();
+        storage.set_string(STORAGE_KEY, "()".to_owned());
+
+        let settings: Settings = eframe::get_value(&storage, STORAGE_KEY).unwrap();
+
+        assert_eq!(settings.settings_version, 0);
+        assert!(settings.features.taskbar_auto_hide);
+    }
+
+    #[test]
+    fn legacy_pending_resolution_is_typed_from_the_persisted_mode() {
+        let mut settings: Settings = ron::from_str(
+            "(settings_version:1,gaming_mode_active:false,pending_resolution_target:Some((width:3440,height:1440)))",
+        )
+        .unwrap();
+
+        migrate_settings(&mut settings, true);
+
+        assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(
+            settings.pending_resolution,
+            Some(PendingResolution::desktop(Resolution::new(3440, 1440)))
+        );
+        assert!(settings.legacy_pending_resolution_target.is_none());
+    }
+
+    #[test]
+    fn legacy_durable_pending_resolution_migrates_and_updates_its_version() {
+        let mut state: DurableModeState = ron::from_str(
+            "(version:1,active:true,pending_resolution_target:Some((width:2560,height:1440)))",
+        )
+        .unwrap();
+
+        assert!(migrate_durable_mode_state(&mut state).unwrap());
+        assert_eq!(state.version, CURRENT_MODE_STATE_VERSION);
+        assert_eq!(
+            state.pending_resolution,
+            Some(PendingResolution::gaming(Resolution::new(2560, 1440)))
+        );
+        assert!(state.legacy_pending_resolution_target.is_none());
+    }
+
+    #[test]
+    fn migrated_recovery_state_remains_available_when_its_rewrite_would_fail() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "borderless-gaming-mode-migration-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(MODE_STATE_FILE_NAME);
+        let blocked_temporary_path = directory.join(MODE_STATE_TEMP_FILE_NAME);
+        fs::write(
+            &path,
+            "(version:1,active:true,pending_resolution_target:Some((width:2560,height:1440)))",
+        )
+        .unwrap();
+        fs::create_dir(&blocked_temporary_path).unwrap();
+
+        let (state, needs_persist) = load_durable_mode_state_at(&path).unwrap().unwrap();
+
+        assert!(needs_persist);
+        assert!(state.active);
+        assert_eq!(
+            state.pending_resolution,
+            Some(PendingResolution::gaming(Resolution::new(2560, 1440)))
+        );
+        assert!(save_durable_mode_state_at(&path, &blocked_temporary_path, &state).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changing_gaming_resolution_preserves_a_desktop_retry() {
+        let pending = PendingResolution::desktop(Resolution::new(5120, 1440));
+        let mut saved = Some(pending);
+
+        assert!(!cancel_pending_gaming_resolution(&mut saved));
+        assert_eq!(saved, Some(pending));
+    }
+
+    #[test]
+    fn changing_gaming_resolution_cancels_only_a_gaming_retry() {
+        let mut saved = Some(PendingResolution::gaming(Resolution::new(3440, 1440)));
+
+        assert!(cancel_pending_gaming_resolution(&mut saved));
+        assert!(saved.is_none());
+    }
+
+    #[test]
+    fn active_mode_and_taskbar_snapshot_round_trip_through_storage() {
+        let mut storage = MemoryStorage::default();
+        let settings = Settings {
+            gaming_mode_active: true,
+            active_mode_features: Some(FeatureChoices::default()),
+            taskbar_auto_hide_before_activation: Some(true),
+            pending_resolution: Some(PendingResolution::gaming(Resolution::new(3440, 1440))),
+            ..Settings::default()
+        };
+
+        store_settings(&mut storage, &settings);
+        let restored: Settings = eframe::get_value(&storage, STORAGE_KEY).unwrap();
+
+        assert!(restored.gaming_mode_active);
+        assert!(restored.active_mode_features.is_some());
+        assert_eq!(restored.taskbar_auto_hide_before_activation, Some(true));
+        assert_eq!(
+            restored.pending_resolution,
+            Some(PendingResolution::gaming(Resolution::new(3440, 1440)))
+        );
+    }
+
+    #[test]
+    fn durable_mode_state_round_trips_through_an_atomic_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "borderless-gaming-mode-state-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(MODE_STATE_FILE_NAME);
+        let temporary_path = directory.join(MODE_STATE_TEMP_FILE_NAME);
+        let state = DurableModeState {
+            active: true,
+            active_mode_features: Some(FeatureChoices::default()),
+            taskbar_auto_hide_before_activation: Some(false),
+            pending_resolution: Some(PendingResolution::gaming(Resolution::new(2560, 1440))),
+            ..DurableModeState::default()
+        };
+
+        save_durable_mode_state_at(&path, &temporary_path, &state).unwrap();
+        let restored: DurableModeState =
+            ron::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert!(restored.active);
+        assert!(restored.active_mode_features.is_some());
+        assert_eq!(restored.taskbar_auto_hide_before_activation, Some(false));
+        assert_eq!(
+            restored.pending_resolution,
+            Some(PendingResolution::gaming(Resolution::new(2560, 1440)))
+        );
+
+        save_durable_mode_state_at(&path, &temporary_path, &DurableModeState::default()).unwrap();
+        let restored: DurableModeState =
+            ron::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!restored.active);
+        assert!(restored.active_mode_features.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn current_persisted_mode_ignores_external_taskbar_changes() {
+        let mut settings = Settings {
+            gaming_mode_active: false,
+            ..Settings::default()
+        };
+
+        migrate_settings(&mut settings, true);
+
+        assert!(!settings.gaming_mode_active);
+        assert!(settings.active_mode_features.is_none());
     }
 
     #[test]
@@ -2228,6 +2930,40 @@ mod tests {
         assert!(!settings.startup_at_login);
         assert!(!settings.startup_minimized);
         assert_eq!(settings.window_transparency, 0);
+    }
+
+    #[test]
+    fn tray_summary_describes_the_configured_gaming_options() {
+        let settings = Settings {
+            features: FeatureChoices {
+                taskbar_auto_hide: true,
+                desktop_icons: false,
+                desktop_background: true,
+                minimize_all_windows: false,
+            },
+            gaming_resolution: Some(Resolution::new(3440, 1440)),
+            ..Settings::default()
+        };
+
+        let presentation = gaming_options_presentation(&settings);
+
+        assert_eq!(presentation.menu_items[0], "Resolution: 3440 × 1440");
+        assert_eq!(presentation.menu_items[1], "Taskbar auto-hide: On");
+        assert!(
+            presentation
+                .menu_items
+                .contains(&"Hide desktop icons: Off".to_owned())
+        );
+        assert!(
+            presentation
+                .menu_items
+                .contains(&"Black desktop background: On".to_owned())
+        );
+        assert!(
+            presentation
+                .menu_items
+                .contains(&"Minimize open windows: Off".to_owned())
+        );
     }
 
     #[test]
@@ -2254,11 +2990,11 @@ mod tests {
     fn tray_mode_menu_tracks_the_current_transition() {
         assert_eq!(
             tray_mode_menu_presentation(ModeVisualState::Desktop),
-            ("Enter Gaming Mode".to_owned(), true)
+            ("Activate Gaming Mode".to_owned(), true)
         );
         assert_eq!(
             tray_mode_menu_presentation(ModeVisualState::EnterPressed),
-            ("Enter Gaming Mode".to_owned(), false)
+            ("Activate Gaming Mode".to_owned(), false)
         );
         assert_eq!(
             tray_mode_menu_presentation(ModeVisualState::Countdown(2)),
@@ -2283,10 +3019,16 @@ mod tests {
     }
 
     #[test]
+    fn tray_default_action_toggles_the_mode() {
+        assert_eq!(TRAY_MODE_MENU_POSITION, 2);
+        assert_eq!(tray_default_command(), TrayCommand::ToggleMode);
+    }
+
+    #[test]
     fn mode_button_tracks_click_countdown_and_apply_phases() {
         assert_eq!(
             mode_button_presentation(ModeVisualState::EnterPressed),
-            ("Enter gaming mode".to_owned(), false)
+            ("Activate gaming mode".to_owned(), false)
         );
         assert!(!mode_button_enabled(ModeVisualState::EnterPressed));
         assert_eq!(
@@ -2390,12 +3132,33 @@ mod tests {
     }
 
     #[test]
-    fn fixed_window_height_fits_every_compiled_option_row() {
-        assert_eq!(fixed_window_height(0), 704.0);
-        assert_eq!(fixed_window_height(1), 738.0);
-        assert_eq!(fixed_window_height(2), 772.0);
-        assert_eq!(fixed_window_height(3), 806.0);
-        assert_eq!(fixed_window_height(4), 840.0);
+    fn fixed_window_height_preserves_the_measured_outer_inset() {
+        assert_eq!(WINDOW_SIZE, [520.0, 710.0]);
+    }
+
+    #[test]
+    fn another_styled_checkbox_row_uses_thirty_six_pixels() {
+        fn rows_height(row_count: usize) -> f32 {
+            let context = egui::Context::default();
+            configure_context(&context);
+            let mut height = 0.0;
+
+            let _output = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(440.0);
+                let top = ui.cursor().top();
+                card(ui, |ui| {
+                    let mut checked = true;
+                    for index in 0..row_count {
+                        accent_checkbox(ui, &mut checked, &format!("Option {index}"));
+                    }
+                });
+                height = ui.cursor().top() - top;
+            });
+
+            height
+        }
+
+        assert_eq!(rows_height(4) - rows_height(3), 36.0);
     }
 
     #[test]

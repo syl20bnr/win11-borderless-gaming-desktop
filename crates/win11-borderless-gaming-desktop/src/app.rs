@@ -1,84 +1,41 @@
 use std::mem::size_of;
 
-use windows::Win32::{
-    Foundation::LPARAM,
-    UI::Shell::{ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, SHAppBarMessage},
-};
-
-#[cfg(feature = "desktop-icons")]
-use windows::core::{Error, w};
-
-#[cfg(any(
-    feature = "desktop-icons",
-    feature = "desktop-background",
-    feature = "minimize-all-windows"
-))]
-use windows::core::Result;
-
-#[cfg(feature = "desktop-icons")]
-use windows::Win32::{
-    Foundation::{E_FAIL, HWND},
-    UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, SW_HIDE, SW_SHOW, ShowWindow},
-};
-
-#[cfg(any(feature = "desktop-background", feature = "minimize-all-windows"))]
-use windows::Win32::{
-    Foundation::RPC_E_CHANGED_MODE,
-    System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+use windows::{
+    Win32::{
+        Foundation::{COLORREF, E_FAIL, HWND, LPARAM, RPC_E_CHANGED_MODE},
+        System::Com::{
+            CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        },
+        UI::{
+            Shell::{
+                ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA, DesktopWallpaper,
+                IDesktopWallpaper, IShellDispatch, SHAppBarMessage, Shell,
+            },
+            WindowsAndMessaging::{FindWindowExW, FindWindowW, SW_HIDE, SW_SHOW, ShowWindow},
+        },
     },
+    core::{Error, Result, w},
 };
 
-#[cfg(feature = "desktop-background")]
-use windows::Win32::{
-    Foundation::COLORREF,
-    UI::Shell::{DesktopWallpaper, IDesktopWallpaper},
-};
-
-#[cfg(feature = "minimize-all-windows")]
-use windows::Win32::UI::Shell::{IShellDispatch, Shell};
-
-/// Runtime choices for the optional behaviors compiled into the executable.
+/// Runtime choices for the behaviors applied by a mode transition.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ToggleOptions {
-    #[cfg(feature = "desktop-icons")]
+    pub taskbar_auto_hide: bool,
     pub desktop_icons: bool,
-    #[cfg(feature = "desktop-background")]
     pub desktop_background: bool,
-    #[cfg(feature = "minimize-all-windows")]
     pub minimize_all_windows: bool,
 }
 
-#[cfg(not(feature = "gui"))]
-impl ToggleOptions {
-    /// Enables every behavior that is present in this build.
-    pub const fn all() -> Self {
-        Self {
-            #[cfg(feature = "desktop-icons")]
-            desktop_icons: true,
-            #[cfg(feature = "desktop-background")]
-            desktop_background: true,
-            #[cfg(feature = "minimize-all-windows")]
-            minimize_all_windows: true,
-        }
-    }
-}
-
-/// The result of applying the main mode toggle.
-#[cfg(feature = "gui")]
-#[derive(Debug)]
-pub struct ToggleReport {
-    pub gaming_mode_enabled: bool,
+/// The result of applying the selected actions for one mode transition.
+#[derive(Debug, Default)]
+pub struct ActionReport {
     pub errors: Vec<String>,
-    pub optional_actions_failed: bool,
 }
 
-#[cfg(any(feature = "desktop-background", feature = "minimize-all-windows"))]
 struct ComApartment {
     uninitialize: bool,
 }
 
-#[cfg(any(feature = "desktop-background", feature = "minimize-all-windows"))]
 impl ComApartment {
     fn initialize() -> Result<Self> {
         match unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok() {
@@ -93,7 +50,6 @@ impl ComApartment {
     }
 }
 
-#[cfg(any(feature = "desktop-background", feature = "minimize-all-windows"))]
 impl Drop for ComApartment {
     fn drop(&mut self) {
         if self.uninitialize {
@@ -102,7 +58,6 @@ impl Drop for ComApartment {
     }
 }
 
-#[cfg(feature = "desktop-icons")]
 fn find_desktop_def_view() -> Result<HWND> {
     unsafe {
         if let Ok(progman) = FindWindowW(w!("Progman"), None)
@@ -128,7 +83,6 @@ fn find_desktop_def_view() -> Result<HWND> {
     ))
 }
 
-#[cfg(feature = "desktop-icons")]
 fn set_desktop_icons_visible(visible: bool) -> Result<()> {
     let def_view = find_desktop_def_view()?;
     let list_view = unsafe { FindWindowExW(Some(def_view), None, w!("SysListView32"), None) }?;
@@ -138,7 +92,6 @@ fn set_desktop_icons_visible(visible: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "desktop-background")]
 fn apply_solid_background(enable_black_background: bool) -> Result<()> {
     let _apartment = ComApartment::initialize()?;
     let wallpaper: IDesktopWallpaper =
@@ -156,7 +109,6 @@ fn apply_solid_background(enable_black_background: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "minimize-all-windows")]
 fn minimize_all_windows() -> Result<()> {
     let _apartment = ComApartment::initialize()?;
     let shell: IShellDispatch = unsafe { CoCreateInstance(&Shell, None, CLSCTX_ALL) }?;
@@ -164,7 +116,7 @@ fn minimize_all_windows() -> Result<()> {
 }
 
 /// Returns whether Windows' primary taskbar currently has auto-hide enabled.
-pub fn gaming_mode_enabled() -> bool {
+pub fn taskbar_auto_hide_enabled() -> bool {
     let mut appbar = APPBARDATA {
         cbSize: size_of::<APPBARDATA>() as u32,
         ..Default::default()
@@ -174,7 +126,7 @@ pub fn gaming_mode_enabled() -> bool {
     (current_state & ABS_AUTOHIDE as usize) != 0
 }
 
-fn set_gaming_mode_enabled(enabled: bool) -> bool {
+fn set_taskbar_auto_hide_enabled(enabled: bool) -> bool {
     let mut appbar = APPBARDATA {
         cbSize: size_of::<APPBARDATA>() as u32,
         ..Default::default()
@@ -190,106 +142,68 @@ fn set_gaming_mode_enabled(enabled: bool) -> bool {
 
     appbar.lParam = LPARAM(next_state as isize);
     let _ = unsafe { SHAppBarMessage(ABM_SETSTATE, &mut appbar) };
-    gaming_mode_enabled()
+    taskbar_auto_hide_enabled()
 }
 
-fn apply_optional_actions(options: ToggleOptions, enable_gaming_mode: bool) -> Vec<String> {
-    #[cfg(any(
-        feature = "desktop-icons",
-        feature = "desktop-background",
-        feature = "minimize-all-windows"
-    ))]
+/// Applies every selected Gaming Mode action, collecting independent failures.
+pub fn activate(options: ToggleOptions) -> ActionReport {
     let mut errors = Vec::new();
-    #[cfg(not(any(
-        feature = "desktop-icons",
-        feature = "desktop-background",
-        feature = "minimize-all-windows"
-    )))]
-    let errors = Vec::new();
 
-    #[cfg(not(any(
-        feature = "desktop-icons",
-        feature = "desktop-background",
-        feature = "minimize-all-windows"
-    )))]
-    let _ = options;
-    #[cfg(not(any(
-        feature = "desktop-icons",
-        feature = "desktop-background",
-        feature = "minimize-all-windows"
-    )))]
-    let _ = enable_gaming_mode;
+    if options.taskbar_auto_hide && !set_taskbar_auto_hide_enabled(true) {
+        errors.push("Taskbar auto-hide: Windows did not enable the requested state".to_owned());
+    }
 
-    #[cfg(feature = "desktop-icons")]
     if options.desktop_icons
-        && let Err(error) = set_desktop_icons_visible(!enable_gaming_mode)
+        && let Err(error) = set_desktop_icons_visible(false)
     {
         errors.push(format!("Desktop icons: {error}"));
     }
 
-    #[cfg(feature = "desktop-background")]
     if options.desktop_background
-        && let Err(error) = apply_solid_background(enable_gaming_mode)
+        && let Err(error) = apply_solid_background(true)
     {
         errors.push(format!("Desktop background: {error}"));
     }
 
-    #[cfg(feature = "minimize-all-windows")]
-    if enable_gaming_mode
-        && options.minimize_all_windows
+    if options.minimize_all_windows
         && let Err(error) = minimize_all_windows()
     {
         errors.push(format!("Minimize windows: {error}"));
     }
 
-    errors
+    ActionReport { errors }
 }
 
-/// Toggles the main gaming state and applies the selected compiled-in behaviors.
-fn apply_toggle(options: ToggleOptions) -> (bool, Vec<String>, bool) {
-    let enable_gaming_mode = !gaming_mode_enabled();
+/// Restores every selected reversible action and the exact captured taskbar state.
+///
+/// Taskbar restoration intentionally runs last. Any reported error should keep the
+/// GUI-owned mode active so the same restoration can be retried.
+pub fn restore(options: ToggleOptions, original_taskbar_auto_hide: Option<bool>) -> ActionReport {
+    let mut errors = Vec::new();
 
-    // Restore selected desktop behaviors before leaving gaming mode. If any
-    // restore fails, keep the main mode active so the same button can retry it.
-    if !enable_gaming_mode {
-        let errors = apply_optional_actions(options, false);
-        if !errors.is_empty() {
-            return (true, errors, true);
+    if options.desktop_icons
+        && let Err(error) = set_desktop_icons_visible(true)
+    {
+        errors.push(format!("Desktop icons: {error}"));
+    }
+
+    if options.desktop_background
+        && let Err(error) = apply_solid_background(false)
+    {
+        errors.push(format!("Desktop background: {error}"));
+    }
+
+    if options.taskbar_auto_hide {
+        match original_taskbar_auto_hide {
+            Some(original) if set_taskbar_auto_hide_enabled(original) != original => errors
+                .push("Taskbar auto-hide: Windows did not restore the original state".to_owned()),
+            Some(_) => {}
+            None => errors.push(
+                "Taskbar auto-hide: The original state is unavailable and could not be restored"
+                    .to_owned(),
+            ),
         }
     }
 
-    let applied_state = set_gaming_mode_enabled(enable_gaming_mode);
-    if applied_state != enable_gaming_mode {
-        return (
-            applied_state,
-            vec!["Taskbar auto-hide: Windows did not apply the requested state".to_owned()],
-            false,
-        );
-    }
-
-    let errors = if enable_gaming_mode {
-        apply_optional_actions(options, true)
-    } else {
-        Vec::new()
-    };
-
-    let optional_actions_failed = !errors.is_empty();
-    (applied_state, errors, optional_actions_failed)
-}
-
-/// Toggles the main gaming state and reports action failures to the GUI.
-#[cfg(feature = "gui")]
-pub fn toggle(options: ToggleOptions) -> ToggleReport {
-    let (gaming_mode_enabled, errors, optional_actions_failed) = apply_toggle(options);
-    ToggleReport {
-        gaming_mode_enabled,
-        errors,
-        optional_actions_failed,
-    }
-}
-
-/// Preserves the original one-click behavior when the GUI feature is absent.
-#[cfg(not(feature = "gui"))]
-pub fn run() {
-    let _ = apply_toggle(ToggleOptions::all());
+    ActionReport { errors }
 }
