@@ -30,19 +30,17 @@
 
 ---
 
-Borderless Gaming Desktop is made for Ultrawide monitors. It gives your Windows
-11 battlestation two loadouts: a comfortable **Desktop Mode** and a
-distraction-free **Gaming Mode**. The app records your Desktop resolution on its
-first start; choose a narrower Gaming resolution and clear distractions in one
-click. The portable app needs no installer or terminal, and it makes no surprise
-desktop changes just because you launched it. It can also start with Windows,
-keep its automatic login launch minimized, and tune whole-window transparency.
+Borderless Gaming Desktop gives your Ultrawide Windows 11 battlestation two
+loadouts: a comfortable **Desktop Mode** and a focused **Gaming Mode**. Pick a
+Gaming resolution, choose your cleanup actions, and switch with one purple
+button. It is portable, needs no installer, and changes nothing just because you
+opened it.
 
 ### Ready, player one?
 
-1. [Download the latest portable executable from GitHub Releases](https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/latest).
-2. Put the `.exe` wherever you like and double-click it. That is the whole installation.
-3. Pick your Gaming resolution and actions, choose the application behavior, then hit the big purple button.
+1. [Download the latest portable `.exe`](https://github.com/syl20bnr/win11-borderless-gaming-desktop/releases/latest).
+2. Put it wherever you like and run it.
+3. Choose your Gaming resolution and actions, then press **Activate gaming mode**.
 
 <p align="center">
   <img
@@ -52,118 +50,56 @@ keep its automatic login launch minimized, and tune whole-window transparency.
   >
 </p>
 
-### Build your Gaming Mode loadout
+### Pick your loadout
 
-The portable release is ready to:
+Gaming Mode can:
 
-- optionally hide the Windows taskbar with auto-hide
+- switch the primary monitor to your chosen resolution
+- auto-hide the taskbar
 - hide desktop icons
-- swap the desktop wallpaper for solid black
+- replace the wallpaper with solid black
 - minimize open windows
-- switch your primary Ultrawide monitor to your chosen Gaming resolution
 
-Every optional desktop action has its own checkbox. **Auto-hide the taskbar** is
-selected by default, while sound effects have a separate **Enable sounds**
-checkbox and are also enabled by default. Selecting a Gaming resolution never
-changes it immediately; it is applied only when you activate Gaming Mode. The
-resolution captured on the app's first start is restored when you return to
-Desktop Mode. Your monitor's preferred resolution is labeled `(native)`, and the
-Gaming resolution combo remains sorted from largest to smallest by height and
-then width. While Gaming Mode is active, its desktop-action checkboxes are locked
-until you restore Desktop Mode; **Enable sounds** remains adjustable.
+Every action is optional. Launch the app first at your everyday resolution; that
+becomes Desktop Mode. Choosing a Gaming resolution does not apply it immediately.
+Press **Restore desktop mode** to bring back the captured resolution and
+reversible desktop settings. Windows minimized during activation stay minimized.
 
-### Tune the application itself
-
-The **Application behavior** card controls how the utility starts and looks:
-
-- **Start at login** adds a per-user Windows login entry, with no administrator
-  access required.
-- **Start minimized** keeps that automatic login launch out of the way; normal
-  manual launches still open the window.
-- **Window transparency** adjusts the whole panel live from fully opaque to an
-  80% safety limit, so it can never become completely invisible.
-
-The current build version is shown unobtrusively in the bottom-right corner.
+Your loadout is saved automatically. Sounds, start-at-login behavior, minimized
+login launches, and window transparency have their own controls too.
 
 ### Two modes. One purple button.
 
 |                | Desktop Mode 🖥️               | Gaming Mode 🎮                |
-|----------------|------------------------------|-------------------------------|
-| **Taskbar**    | Original setting restored    | Auto-hide when selected       |
-| **Desktop**    | Icons and wallpaper restored | Your selected cleanup actions |
-| **Resolution** | Captured on first start       | Your selected profile         |
-| **Status LED** | Cool gray                    | Bright green                  |
+|----------------|--------------------------------|-------------------------------|
+| **Resolution** | Captured Desktop resolution    | Chosen Gaming resolution      |
+| **Taskbar**    | Original setting restored      | Auto-hide when selected       |
+| **Desktop**    | Icons and wallpaper restored   | Selected cleanup actions      |
+| **Status LED** | Cool gray                      | Bright green                  |
 
-Press **Activate gaming mode** and the button finishes its click animation before
-starting the spinner and **3 → 2 → 1** countdown. The wordmark stays **Desktop
-mode** throughout the countdown. When sound effects are enabled, each number
-gets a soft sci-fi pulse; the app silently primes its native audio output during
-the click animation so the first pulse starts cleanly. When **1** finishes, the
-spinner disappears, the wordmark switches to **Gaming mode**, and the button
-shows **Activating...** while Windows applies the mode changes. The LED pulses
-orange while the tray icon blinks, then turns green as a short power-up cue
-confirms that the battlestation is ready.
+### Stays out of your way
 
-Press **Restore desktop mode** when the match is over. Its click animation
-finishes before the wordmark switches to **Desktop mode**, the LED turns orange
-and pulses, and the spinner-free button changes to **Restoring...** while Windows
-restores the selected desktop actions, the Desktop resolution, and, when
-selected, the exact taskbar setting captured during activation. When sounds are
-enabled, a compact power-down cue confirms the switch. Minimized windows stay
-minimized; the app will not unexpectedly reopen them over your post-game screen.
-
-### Your loadout remembers you
-
-Action checkboxes, the sound-effects preference, the captured Desktop resolution,
-your Gaming resolution, the current app-owned mode, the minimized-start
-preference, and window transparency are saved automatically.
-**Start at login** reflects the real Windows login entry instead of keeping a
-separate stale flag. Close the app, reboot, come back tomorrow, your choices are
-still equipped.
-
-While Gaming Mode is active, the app also preserves the activation snapshot and,
-when taskbar auto-hide is selected, its original setting, so relaunching does not
-lose the information needed for an exact Desktop Mode restore. A failed
-resolution target is preserved too, so **Retry resolution** remains available
-after a relaunch.
-
-Gaming Mode uses its own persistent state instead of inferring the mode from
-Windows taskbar auto-hide. This keeps the mode reliable when the taskbar action
-is turned off or when another program changes the taskbar setting. When taskbar
-auto-hide is selected, activation records the current Windows setting before
-enabling it, and Desktop Mode restores that exact original setting.
-
-Only one app instance can run at a time, preventing two windows from competing
-over the same mode snapshot. Launching the app again brings the existing window
-forward and exits the duplicate process.
-
-### Living in the system tray
-
-- The custom close button and `Alt+F4` hide the app in the system tray without leaving it in the taskbar. The first close explains this once.
-- Double-click the tray icon to activate Gaming Mode or restore Desktop Mode.
-- Right-click it to **Open**, **Activate Gaming Mode / Restore Desktop Mode**, or **Quit**; the same menu includes a disabled summary of the configured Gaming options.
-- The tray LED mirrors the app: gray for Desktop, blinking orange during the countdown and while either mode is being applied, and green for Gaming.
-- A regular Windows minimize remains a regular taskbar minimize.
+- Closing the window or pressing `Alt+F4` hides the app in the system tray.
+- A normal Windows minimize still minimizes to the taskbar.
+- Double-clicking the tray icon switches modes.
+- Right-clicking it opens the app, switches modes, quits, and shows your loadout.
+- Only one instance runs; launching it again brings the existing window forward.
 
 > [!TIP]
-> **Quit** means quit, it does not silently change your mode. If you are still in Gaming Mode, restore Desktop Mode first when you want the everyday desktop back.
+> **Quit** closes the app without changing modes. Restore Desktop Mode first if
+> you want your everyday setup back.
 
-## Advanced Users and Developers
-
-The project ships as one full desktop app with its control panel, system tray,
-sound effects, resolution profiles, and Gaming Mode actions included.
-
-### Build or install the app
+## Build it yourself
 
 Requirements: **Windows 11** and **Rust 1.94 or newer**.
 
-Install the published crates.io app:
+Install the published crate:
 
 ```powershell
 cargo install win11-borderless-gaming-desktop
 ```
 
-Or build this repository:
+Or build the repository:
 
 ```powershell
 cargo build --release --package win11-borderless-gaming-desktop
@@ -175,68 +111,29 @@ The executable is written to:
 target/release/win11-borderless-gaming-desktop.exe
 ```
 
-A normal manual launch opens the GUI and does not toggle anything on startup.
-When **Start at login** is enabled, Windows launches the same portable executable
-for the current user; **Start minimized** applies only to that automatic launch.
-
 ### Developer power-ups
 
-Regenerate the runtime media, build in release mode, and launch the app:
+Build and launch the app:
 
 ```powershell
 cargo xtask run
 ```
 
-Regenerate the compact embedded artwork and procedural sound cues plus the
-application and tray icons:
+Regenerate embedded media and icons:
 
 ```powershell
 cargo xtask assets
 ```
 
-The pipeline downsizes mode wordmarks in linear light with premultiplied alpha,
-and the app uses linear mipmaps so their edges stay smooth at display size. It
-embeds its compact media from `assets/runtime`; `app.ico` supplies the executable
-icon, and the three dependency-free sound cues total about 84 KiB. `gui.png` and
-`readme-logo-master.png` are documentation-only and do not affect executable
-size.
-
-Run the test suite and the repository checks before sending your build into ranked:
+Run the tests and repository checks before sending your build into ranked:
 
 ```powershell
 cargo test --workspace
 cargo xtask check all
 ```
 
-`cargo xtask check all` covers formatting, strict Clippy, dependency auditing, and typo checks. The Rust tests are the separate first command.
-
-### How the mode switch works
-
-The app owns the Gaming/Desktop mode as a persistent boolean; Windows taskbar
-auto-hide no longer determines it. Activating Gaming Mode snapshots the selected
-actions and the taskbar's current auto-hide setting. If **Auto-hide the taskbar**
-is selected, the app enables it for Gaming Mode and restores the captured setting
-when returning to Desktop Mode. The other selected desktop actions follow the
-same activation and restoration flow, while minimize-windows runs only during
-activation.
-
-Resolution modes are collected from the primary monitor at startup, deduplicated,
-and sorted by height then width from largest to smallest in the Gaming resolution
-combo. Modes taller than the monitor's native height are filtered out. The
-current resolution is captured as the hidden Desktop restore profile the first
-time settings are initialized. Choosing a Gaming resolution does not apply it
-immediately: activation applies it, and restoration returns to the captured
-Desktop profile. Windows keeps or chooses compatible refresh-rate, color-depth,
-and orientation values when applying the selected width and height. The tray icon
-and its default double-click action follow the persistent mode, while its context
-menu shows the currently configured Gaming options.
-
-**Start at login** uses the current user's
-`Software\Microsoft\Windows\CurrentVersion\Run` registry key. When **Start
-minimized** is selected, the login command adds the app's internal `--minimized`
-argument. Saved window transparency is restored automatically as the native
-window becomes visible, uses Windows layered-window alpha, and is capped at 80%
-to keep the control panel recoverable.
+`cargo xtask check all` covers formatting, strict Clippy, dependency auditing,
+and typo checks.
 
 ### License
 
