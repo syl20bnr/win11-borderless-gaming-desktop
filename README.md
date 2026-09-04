@@ -54,14 +54,15 @@ opened it.
 
 Gaming Mode can:
 
-- switch the primary monitor to your chosen resolution
+- switch the primary monitor to your chosen resolution when **Change resolution** is checked
 - auto-hide the taskbar
 - hide desktop icons
 - replace the wallpaper with solid black
 - minimize open windows
 
 Every action is optional. Launch the app first at your everyday resolution; that
-becomes Desktop Mode. Choosing a Gaming resolution does not apply it immediately.
+becomes Desktop Mode. The selected Gaming resolution is remembered even when
+**Change resolution** is unchecked, and choosing it does not apply it immediately.
 Press **Restore desktop mode** to bring back the captured resolution and
 reversible desktop settings. Windows minimized during activation stay minimized.
 

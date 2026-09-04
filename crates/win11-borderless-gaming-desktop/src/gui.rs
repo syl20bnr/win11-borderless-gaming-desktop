@@ -140,6 +140,7 @@ fn window_icon() -> Option<egui::IconData> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct FeatureChoices {
+    change_resolution: bool,
     taskbar_auto_hide: bool,
     desktop_icons: bool,
     desktop_background: bool,
@@ -150,6 +151,7 @@ struct FeatureChoices {
 impl Default for FeatureChoices {
     fn default() -> Self {
         Self {
+            change_resolution: true,
             taskbar_auto_hide: true,
             desktop_icons: true,
             desktop_background: true,
@@ -670,6 +672,18 @@ fn cancel_pending_gaming_resolution(pending: &mut Option<PendingResolution>) -> 
     }
 }
 
+fn pending_resolution_for_mode(
+    gaming_mode_active: bool,
+    change_resolution: bool,
+    target: Option<Resolution>,
+) -> Option<PendingResolution> {
+    if change_resolution {
+        target.map(|target| PendingResolution::for_mode(gaming_mode_active, target))
+    } else {
+        None
+    }
+}
+
 struct GuiApp {
     settings: Settings,
     native_window: Option<HWND>,
@@ -863,10 +877,11 @@ impl GuiApp {
             self.settings.taskbar_auto_hide_before_activation = choices
                 .taskbar_auto_hide
                 .then(app::taskbar_auto_hide_enabled);
-            self.settings.pending_resolution = self
-                .settings
-                .gaming_resolution
-                .map(PendingResolution::gaming);
+            self.settings.pending_resolution = pending_resolution_for_mode(
+                true,
+                choices.change_resolution,
+                self.settings.gaming_resolution,
+            );
 
             // Commit a synchronous recovery record before changing Windows. A
             // crash at any later point can then be repaired or retried.
@@ -914,10 +929,11 @@ impl GuiApp {
                 self.settings.gaming_mode_active = false;
                 self.settings.active_mode_features = None;
                 self.settings.taskbar_auto_hide_before_activation = None;
-                self.settings.pending_resolution = self
-                    .settings
-                    .desktop_resolution
-                    .map(PendingResolution::desktop);
+                self.settings.pending_resolution = pending_resolution_for_mode(
+                    false,
+                    choices.change_resolution,
+                    self.settings.desktop_resolution,
+                );
 
                 // Windows actions are restored, but the app remains logically
                 // active until the Desktop state is durably committed.
@@ -1266,11 +1282,15 @@ impl GuiApp {
                 );
             }
 
-            if gaming_mode && self.restore_actions_failed {
-                self.settings.active_mode_features = Some(self.settings.features.clone());
-            }
-
             ui.add_space(4.0);
+            ui.add_enabled_ui(!gaming_mode || self.restore_actions_failed, |ui| {
+                accent_checkbox(
+                    ui,
+                    &mut self.settings.features.change_resolution,
+                    "Change resolution:",
+                );
+            });
+            ui.add_space(3.0);
             gaming_resolution_combo_box(
                 ui,
                 &resolutions,
@@ -1278,6 +1298,10 @@ impl GuiApp {
                 native_resolution,
                 &mut self.settings.gaming_resolution,
             );
+
+            if gaming_mode && self.restore_actions_failed {
+                self.settings.active_mode_features = Some(self.settings.features.clone());
+            }
         });
 
         if self.settings.gaming_resolution != previous_gaming_resolution {
@@ -1892,7 +1916,11 @@ fn gaming_options_presentation(settings: &Settings) -> GamingOptionsPresentation
         |resolution| resolution.to_string(),
     );
     let menu_items = vec![
-        format!("Resolution: {resolution}"),
+        format!(
+            "Change resolution: {}",
+            on_off(settings.features.change_resolution)
+        ),
+        format!("Gaming resolution: {resolution}"),
         format!(
             "Taskbar auto-hide: {}",
             on_off(settings.features.taskbar_auto_hide)
@@ -1941,9 +1969,6 @@ fn gaming_resolution_combo_box(
     native: Option<Resolution>,
     selection: &mut Option<Resolution>,
 ) {
-    ui.label(RichText::new("Resolution").size(13.0).strong());
-    ui.add_space(3.0);
-
     if resolutions.is_empty() {
         Frame::new()
             .fill(Color32::from_rgb(14, 18, 28))
@@ -2648,7 +2673,7 @@ mod tests {
     }
 
     #[test]
-    fn gaming_resolution_combo_is_stacked_below_its_label() {
+    fn gaming_resolution_combo_uses_the_full_control_width() {
         let context = egui::Context::default();
         configure_context(&context);
         let resolutions = [Resolution::new(5120, 1440), Resolution::new(3440, 1440)];
@@ -2668,7 +2693,7 @@ mod tests {
             control_height = ui.cursor().top() - top;
         });
 
-        assert_eq!(control_height, 66.0);
+        assert_eq!(control_height, 40.0);
     }
 
     #[test]
@@ -2722,6 +2747,37 @@ mod tests {
     }
 
     #[test]
+    fn resolution_changes_are_enabled_by_default() {
+        assert!(Settings::default().features.change_resolution);
+    }
+
+    #[test]
+    fn unchecked_resolution_change_does_not_create_a_pending_transition() {
+        let gaming = Resolution::new(3440, 1440);
+
+        assert_eq!(pending_resolution_for_mode(true, false, Some(gaming)), None);
+        assert_eq!(
+            pending_resolution_for_mode(false, false, Some(gaming)),
+            None
+        );
+    }
+
+    #[test]
+    fn checked_resolution_change_targets_the_requested_mode() {
+        let gaming = Resolution::new(3440, 1440);
+        let desktop = Resolution::new(5120, 1440);
+
+        assert_eq!(
+            pending_resolution_for_mode(true, true, Some(gaming)),
+            Some(PendingResolution::gaming(gaming))
+        );
+        assert_eq!(
+            pending_resolution_for_mode(false, true, Some(desktop)),
+            Some(PendingResolution::desktop(desktop))
+        );
+    }
+
+    #[test]
     fn legacy_gaming_mode_migrates_to_persisted_state() {
         let mut settings = Settings {
             settings_version: 0,
@@ -2762,6 +2818,16 @@ mod tests {
 
         assert_eq!(settings.settings_version, 0);
         assert!(settings.features.taskbar_auto_hide);
+    }
+
+    #[test]
+    fn saved_feature_choices_without_resolution_checkbox_keep_legacy_behavior() {
+        let settings: Settings = ron::from_str(
+            "(settings_version:2,features:(taskbar_auto_hide:false,desktop_icons:false,desktop_background:false,minimize_all_windows:false))",
+        )
+        .unwrap();
+
+        assert!(settings.features.change_resolution);
     }
 
     #[test]
@@ -2850,9 +2916,14 @@ mod tests {
     fn active_mode_and_taskbar_snapshot_round_trip_through_storage() {
         let mut storage = MemoryStorage::default();
         let settings = Settings {
+            features: FeatureChoices {
+                change_resolution: false,
+                ..FeatureChoices::default()
+            },
             gaming_mode_active: true,
             active_mode_features: Some(FeatureChoices::default()),
             taskbar_auto_hide_before_activation: Some(true),
+            gaming_resolution: Some(Resolution::new(3440, 1440)),
             pending_resolution: Some(PendingResolution::gaming(Resolution::new(3440, 1440))),
             ..Settings::default()
         };
@@ -2861,6 +2932,11 @@ mod tests {
         let restored: Settings = eframe::get_value(&storage, STORAGE_KEY).unwrap();
 
         assert!(restored.gaming_mode_active);
+        assert!(!restored.features.change_resolution);
+        assert_eq!(
+            restored.gaming_resolution,
+            Some(Resolution::new(3440, 1440))
+        );
         assert!(restored.active_mode_features.is_some());
         assert_eq!(restored.taskbar_auto_hide_before_activation, Some(true));
         assert_eq!(
@@ -2936,6 +3012,7 @@ mod tests {
     fn tray_summary_describes_the_configured_gaming_options() {
         let settings = Settings {
             features: FeatureChoices {
+                change_resolution: false,
                 taskbar_auto_hide: true,
                 desktop_icons: false,
                 desktop_background: true,
@@ -2947,8 +3024,9 @@ mod tests {
 
         let presentation = gaming_options_presentation(&settings);
 
-        assert_eq!(presentation.menu_items[0], "Resolution: 3440 × 1440");
-        assert_eq!(presentation.menu_items[1], "Taskbar auto-hide: On");
+        assert_eq!(presentation.menu_items[0], "Change resolution: Off");
+        assert_eq!(presentation.menu_items[1], "Gaming resolution: 3440 × 1440");
+        assert_eq!(presentation.menu_items[2], "Taskbar auto-hide: On");
         assert!(
             presentation
                 .menu_items
