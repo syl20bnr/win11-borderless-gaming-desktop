@@ -6,7 +6,8 @@ version = "0.0.0"
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 strum = { version = "0.27.2", features = ["derive"] }
-tracel-xtask = { version = "5.1.0", default-features = false, features = [
+tracel-xtask = { version = "5.2.0", default-features = false, features = [
+    "build",
     "bump",
     "check",
     "fix",
