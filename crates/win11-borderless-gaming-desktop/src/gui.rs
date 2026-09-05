@@ -62,7 +62,7 @@ const WINDOW_WIDTH: f32 = 520.0;
 // the same 24 px outer inset as the other three sides of the fixed window.
 const WINDOW_HEIGHT: f32 = 710.0;
 const TRANSPARENCY_CONTROL_HEIGHT: f32 = 66.0;
-const TRAY_MODE_MENU_POSITION: u32 = 2;
+const TRAY_OPEN_MENU_POSITION: u32 = 0;
 const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, WINDOW_HEIGHT];
 
 const BACKGROUND: Color32 = Color32::from_rgb(12, 15, 22);
@@ -459,6 +459,7 @@ fn migrate_settings(settings: &mut Settings, legacy_taskbar_auto_hide: bool) {
 enum TrayCommand {
     Open,
     ToggleMode,
+    ActivateModeWithoutResolution,
     Quit,
 }
 
@@ -508,6 +509,7 @@ struct GamingOptionsPresentation {
 
 struct TrayMenuItems {
     mode: MenuItem,
+    mode_without_resolution: MenuItem,
     gaming_options: Vec<MenuItem>,
 }
 
@@ -684,6 +686,12 @@ fn pending_resolution_for_mode(
     }
 }
 
+fn activation_choices(features: &FeatureChoices, change_resolution: bool) -> FeatureChoices {
+    let mut choices = features.clone();
+    choices.change_resolution &= change_resolution;
+    choices
+}
+
 struct GuiApp {
     settings: Settings,
     native_window: Option<HWND>,
@@ -696,10 +704,12 @@ struct GuiApp {
     tray_icon: TrayIcon,
     tray_icon_state: TrayIconState,
     tray_mode_item: MenuItem,
+    tray_mode_without_resolution_item: MenuItem,
     tray_menu_state: ModeVisualState,
     tray_gaming_option_items: Vec<MenuItem>,
     tray_gaming_option_labels: Vec<String>,
     mode_transition: Option<ModeTransitionState>,
+    activation_changes_resolution: bool,
     last_countdown_digit: Option<u8>,
     sound_player: sound::SoundPlayer,
     close_notice_open: bool,
@@ -816,10 +826,12 @@ impl GuiApp {
             tray_icon,
             tray_icon_state,
             tray_mode_item: tray_menu_items.mode,
+            tray_mode_without_resolution_item: tray_menu_items.mode_without_resolution,
             tray_menu_state: mode_state,
             tray_gaming_option_items: tray_menu_items.gaming_options,
             tray_gaming_option_labels: tray_gaming_options.menu_items,
             mode_transition: None,
+            activation_changes_resolution: true,
             last_countdown_digit: None,
             sound_player: sound::SoundPlayer::default(),
             close_notice_open: false,
@@ -870,7 +882,9 @@ impl GuiApp {
                 .clone()
                 .unwrap_or_else(|| self.settings.features.clone())
         } else {
-            let choices = self.settings.features.clone();
+            let choices =
+                activation_choices(&self.settings.features, self.activation_changes_resolution);
+            self.activation_changes_resolution = true;
             let previous_pending_resolution = self.settings.pending_resolution;
             self.settings.gaming_mode_active = true;
             self.settings.active_mode_features = Some(choices.clone());
@@ -1013,6 +1027,15 @@ impl GuiApp {
     }
 
     fn request_mode_toggle(&mut self, context: &egui::Context, now: f64) {
+        self.request_mode_toggle_with_resolution(context, now, true);
+    }
+
+    fn request_mode_toggle_with_resolution(
+        &mut self,
+        context: &egui::Context,
+        now: f64,
+        change_resolution: bool,
+    ) {
         if self.mode_transition.is_some() {
             return;
         }
@@ -1020,6 +1043,7 @@ impl GuiApp {
         self.errors.clear();
         self.pending_resolution = None;
         let gaming_mode = self.settings.gaming_mode_active;
+        self.activation_changes_resolution = gaming_mode || change_resolution;
         self.mode_transition = Some(if gaming_mode {
             ModeTransitionState::RestorePressed(now)
         } else {
@@ -1099,6 +1123,8 @@ impl GuiApp {
         let (label, enabled) = tray_mode_menu_presentation(state);
         self.tray_mode_item.set_text(label);
         self.tray_mode_item.set_enabled(enabled);
+        self.tray_mode_without_resolution_item
+            .set_enabled(matches!(state, ModeVisualState::Desktop));
         self.tray_menu_state = state;
     }
 
@@ -1577,6 +1603,9 @@ impl eframe::App for GuiApp {
                     self.begin_fixed_size_settle(context);
                 }
                 TrayCommand::ToggleMode => self.request_mode_toggle(context, now),
+                TrayCommand::ActivateModeWithoutResolution => {
+                    self.request_mode_toggle_with_resolution(context, now, false);
+                }
                 TrayCommand::Quit => {
                     self.quitting = true;
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1826,6 +1855,11 @@ fn create_tray(
     let open_item = MenuItem::new("Open", true, None);
     let (mode_label, mode_enabled) = tray_mode_menu_presentation(mode_state);
     let mode_item = MenuItem::new(mode_label, mode_enabled, None);
+    let mode_without_resolution_item = MenuItem::new(
+        "Activate without resolution",
+        matches!(mode_state, ModeVisualState::Desktop),
+        None,
+    );
     let open_separator = PredefinedMenuItem::separator();
     let options_separator = PredefinedMenuItem::separator();
     let options_heading = MenuItem::new("Gaming mode options", false, None);
@@ -1839,6 +1873,7 @@ fn create_tray(
     menu.append(&open_item)?;
     menu.append(&open_separator)?;
     menu.append(&mode_item)?;
+    menu.append(&mode_without_resolution_item)?;
     menu.append(&options_separator)?;
     menu.append(&options_heading)?;
     for item in &option_items {
@@ -1849,7 +1884,7 @@ fn create_tray(
     unsafe {
         SetMenuDefaultItem(
             HMENU(menu.hpopupmenu() as *mut core::ffi::c_void),
-            TRAY_MODE_MENU_POSITION,
+            TRAY_OPEN_MENU_POSITION,
             1,
         )?;
     }
@@ -1866,6 +1901,7 @@ fn create_tray(
 
     let open_id = open_item.id().clone();
     let mode_id = mode_item.id().clone();
+    let mode_without_resolution_id = mode_without_resolution_item.id().clone();
     let quit_id = quit_item.id().clone();
     let menu_sender = sender.clone();
     let menu_context = context.clone();
@@ -1874,6 +1910,8 @@ fn create_tray(
             Some(TrayCommand::Open)
         } else if event.id == mode_id {
             Some(TrayCommand::ToggleMode)
+        } else if event.id == mode_without_resolution_id {
+            Some(TrayCommand::ActivateModeWithoutResolution)
         } else if event.id == quit_id {
             Some(TrayCommand::Quit)
         } else {
@@ -1904,6 +1942,7 @@ fn create_tray(
         tray_icon,
         TrayMenuItems {
             mode: mode_item,
+            mode_without_resolution: mode_without_resolution_item,
             gaming_options: option_items,
         },
         receiver,
@@ -2556,7 +2595,7 @@ fn tray_mode_menu_presentation(state: ModeVisualState) -> (String, bool) {
 }
 
 const fn tray_default_command() -> TrayCommand {
-    TrayCommand::ToggleMode
+    TrayCommand::Open
 }
 
 fn mode_button_presentation(state: ModeVisualState) -> (String, bool) {
@@ -2749,6 +2788,22 @@ mod tests {
     #[test]
     fn resolution_changes_are_enabled_by_default() {
         assert!(Settings::default().features.change_resolution);
+    }
+
+    #[test]
+    fn activation_without_resolution_preserves_every_other_configured_action() {
+        let configured = FeatureChoices::default();
+
+        let choices = activation_choices(&configured, false);
+
+        assert!(!choices.change_resolution);
+        assert_eq!(choices.taskbar_auto_hide, configured.taskbar_auto_hide);
+        assert_eq!(choices.desktop_icons, configured.desktop_icons);
+        assert_eq!(choices.desktop_background, configured.desktop_background);
+        assert_eq!(
+            choices.minimize_all_windows,
+            configured.minimize_all_windows
+        );
     }
 
     #[test]
@@ -3097,9 +3152,9 @@ mod tests {
     }
 
     #[test]
-    fn tray_default_action_toggles_the_mode() {
-        assert_eq!(TRAY_MODE_MENU_POSITION, 2);
-        assert_eq!(tray_default_command(), TrayCommand::ToggleMode);
+    fn tray_default_action_opens_the_window() {
+        assert_eq!(TRAY_OPEN_MENU_POSITION, 0);
+        assert_eq!(tray_default_command(), TrayCommand::Open);
     }
 
     #[test]
