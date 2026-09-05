@@ -58,9 +58,10 @@ const WORDMARK_TEXTURE_OPTIONS: egui::TextureOptions =
 const HEADER_HEIGHT: f32 = 50.0;
 const HEADER_CLOSE_CLEARANCE: f32 = 24.0;
 const WINDOW_WIDTH: f32 = 520.0;
+const MAIN_BOTTOM_INSET: i8 = 12;
 // Measured from the full rendered app so the application-behavior card keeps
-// the same 24 px outer inset as the other three sides of the fixed window.
-const WINDOW_HEIGHT: f32 = 710.0;
+// a compact bottom inset in the fixed window.
+const WINDOW_HEIGHT: f32 = 688.0;
 const TRANSPARENCY_CONTROL_HEIGHT: f32 = 66.0;
 const TRAY_OPEN_MENU_POSITION: u32 = 0;
 const WINDOW_SIZE: [f32; 2] = [WINDOW_WIDTH, WINDOW_HEIGHT];
@@ -503,14 +504,9 @@ enum TrayIconState {
     Gaming,
 }
 
-struct GamingOptionsPresentation {
-    menu_items: Vec<String>,
-}
-
 struct TrayMenuItems {
     mode: MenuItem,
     mode_without_resolution: MenuItem,
-    gaming_options: Vec<MenuItem>,
 }
 
 #[derive(Clone, Copy)]
@@ -706,8 +702,6 @@ struct GuiApp {
     tray_mode_item: MenuItem,
     tray_mode_without_resolution_item: MenuItem,
     tray_menu_state: ModeVisualState,
-    tray_gaming_option_items: Vec<MenuItem>,
-    tray_gaming_option_labels: Vec<String>,
     mode_transition: Option<ModeTransitionState>,
     activation_changes_resolution: bool,
     last_countdown_digit: Option<u8>,
@@ -800,13 +794,8 @@ impl GuiApp {
         } else {
             TrayIconState::Desktop
         };
-        let tray_gaming_options = gaming_options_presentation(&settings);
-        let (tray_icon, tray_menu_items, tray_commands) = create_tray(
-            &creation_context.egui_ctx,
-            tray_icon_state,
-            mode_state,
-            &tray_gaming_options,
-        )?;
+        let (tray_icon, tray_menu_items, tray_commands) =
+            create_tray(&creation_context.egui_ctx, tray_icon_state, mode_state)?;
 
         if start_minimized {
             hide_to_tray(&creation_context.egui_ctx);
@@ -828,8 +817,6 @@ impl GuiApp {
             tray_mode_item: tray_menu_items.mode,
             tray_mode_without_resolution_item: tray_menu_items.mode_without_resolution,
             tray_menu_state: mode_state,
-            tray_gaming_option_items: tray_menu_items.gaming_options,
-            tray_gaming_option_labels: tray_gaming_options.menu_items,
             mode_transition: None,
             activation_changes_resolution: true,
             last_countdown_digit: None,
@@ -1128,26 +1115,6 @@ impl GuiApp {
         self.tray_menu_state = state;
     }
 
-    fn sync_tray_gaming_options(&mut self) {
-        let presentation = gaming_options_presentation(&self.settings);
-        if presentation.menu_items == self.tray_gaming_option_labels {
-            return;
-        }
-
-        debug_assert_eq!(
-            self.tray_gaming_option_items.len(),
-            presentation.menu_items.len()
-        );
-        for (item, label) in self
-            .tray_gaming_option_items
-            .iter()
-            .zip(&presentation.menu_items)
-        {
-            item.set_text(label);
-        }
-        self.tray_gaming_option_labels = presentation.menu_items;
-    }
-
     fn apply_profile_resolution(&self, target: Resolution) -> Result<(), String> {
         let current = display::primary_resolution()
             .map_err(|error| format!("Could not read the current resolution: {error}"))?;
@@ -1273,9 +1240,6 @@ impl GuiApp {
         let native_resolution = self.display.native;
 
         card(ui, |ui| {
-            ui.label(RichText::new("Gaming mode options").size(15.0).strong());
-            ui.add_space(4.0);
-
             ui.add_enabled_ui(!gaming_mode || self.restore_actions_failed, |ui| {
                 accent_checkbox(
                     ui,
@@ -1669,7 +1633,6 @@ impl eframe::App for GuiApp {
         let tray_icon_state = self.desired_tray_icon_state(state, now);
         self.sync_tray_icon(tray_icon_state);
         self.sync_tray_menu(state);
-        self.sync_tray_gaming_options();
 
         if self.fixed_size_settle_passes > 0 {
             request_fixed_window_size(context);
@@ -1716,7 +1679,9 @@ impl eframe::App for GuiApp {
                 left: 24,
                 right: 24,
                 top: 32,
-                bottom: 24,
+                // The compact window needs this space for the final card's
+                // bottom padding and stroke, otherwise the scroll clip cuts it off.
+                bottom: MAIN_BOTTOM_INSET,
             }))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -1849,7 +1814,6 @@ fn create_tray(
     context: &egui::Context,
     icon_state: TrayIconState,
     mode_state: ModeVisualState,
-    gaming_options: &GamingOptionsPresentation,
 ) -> Result<(TrayIcon, TrayMenuItems, Receiver<TrayCommand>), Box<dyn Error + Send + Sync>> {
     let menu = Menu::new();
     let open_item = MenuItem::new("Open", true, None);
@@ -1861,24 +1825,12 @@ fn create_tray(
         None,
     );
     let open_separator = PredefinedMenuItem::separator();
-    let options_separator = PredefinedMenuItem::separator();
-    let options_heading = MenuItem::new("Gaming mode options", false, None);
-    let option_items = gaming_options
-        .menu_items
-        .iter()
-        .map(|label| MenuItem::new(label, false, None))
-        .collect::<Vec<_>>();
     let quit_separator = PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&open_item)?;
     menu.append(&open_separator)?;
     menu.append(&mode_item)?;
     menu.append(&mode_without_resolution_item)?;
-    menu.append(&options_separator)?;
-    menu.append(&options_heading)?;
-    for item in &option_items {
-        menu.append(item)?;
-    }
     menu.append(&quit_separator)?;
     menu.append(&quit_item)?;
     unsafe {
@@ -1943,46 +1895,9 @@ fn create_tray(
         TrayMenuItems {
             mode: mode_item,
             mode_without_resolution: mode_without_resolution_item,
-            gaming_options: option_items,
         },
         receiver,
     ))
-}
-
-fn gaming_options_presentation(settings: &Settings) -> GamingOptionsPresentation {
-    let resolution = settings.gaming_resolution.map_or_else(
-        || "Unavailable".to_owned(),
-        |resolution| resolution.to_string(),
-    );
-    let menu_items = vec![
-        format!(
-            "Change resolution: {}",
-            on_off(settings.features.change_resolution)
-        ),
-        format!("Gaming resolution: {resolution}"),
-        format!(
-            "Taskbar auto-hide: {}",
-            on_off(settings.features.taskbar_auto_hide)
-        ),
-        format!(
-            "Hide desktop icons: {}",
-            on_off(settings.features.desktop_icons)
-        ),
-        format!(
-            "Black desktop background: {}",
-            on_off(settings.features.desktop_background)
-        ),
-        format!(
-            "Minimize open windows: {}",
-            on_off(settings.features.minimize_all_windows)
-        ),
-    ];
-
-    GamingOptionsPresentation { menu_items }
-}
-
-const fn on_off(enabled: bool) -> &'static str {
-    if enabled { "On" } else { "Off" }
 }
 
 fn tray_status_icon(state: TrayIconState) -> Result<Icon, Box<dyn Error + Send + Sync>> {
@@ -3064,42 +2979,6 @@ mod tests {
     }
 
     #[test]
-    fn tray_summary_describes_the_configured_gaming_options() {
-        let settings = Settings {
-            features: FeatureChoices {
-                change_resolution: false,
-                taskbar_auto_hide: true,
-                desktop_icons: false,
-                desktop_background: true,
-                minimize_all_windows: false,
-            },
-            gaming_resolution: Some(Resolution::new(3440, 1440)),
-            ..Settings::default()
-        };
-
-        let presentation = gaming_options_presentation(&settings);
-
-        assert_eq!(presentation.menu_items[0], "Change resolution: Off");
-        assert_eq!(presentation.menu_items[1], "Gaming resolution: 3440 × 1440");
-        assert_eq!(presentation.menu_items[2], "Taskbar auto-hide: On");
-        assert!(
-            presentation
-                .menu_items
-                .contains(&"Hide desktop icons: Off".to_owned())
-        );
-        assert!(
-            presentation
-                .menu_items
-                .contains(&"Black desktop background: On".to_owned())
-        );
-        assert!(
-            presentation
-                .menu_items
-                .contains(&"Minimize open windows: Off".to_owned())
-        );
-    }
-
-    #[test]
     fn transparency_slider_uses_the_full_available_width() {
         let context = egui::Context::default();
         configure_context(&context);
@@ -3284,7 +3163,74 @@ mod tests {
 
     #[test]
     fn fixed_window_height_preserves_the_measured_outer_inset() {
-        assert_eq!(WINDOW_SIZE, [520.0, 710.0]);
+        assert_eq!(WINDOW_SIZE, [520.0, 688.0]);
+    }
+
+    #[test]
+    fn final_card_border_fits_inside_scroll_clip() {
+        let context = egui::Context::default();
+        configure_context(&context);
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::from(WINDOW_SIZE),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(Frame::new().inner_margin(Margin {
+                        left: 24,
+                        right: 24,
+                        top: 32,
+                        bottom: MAIN_BOTTOM_INSET,
+                    }))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                // The application-behavior card begins here in the normal layout.
+                                ui.allocate_exact_size(Vec2::new(1.0, 392.0), egui::Sense::hover());
+                                card(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("Application behavior").size(15.0).strong(),
+                                    );
+                                    ui.add_space(4.0);
+                                    let mut checked = false;
+                                    accent_checkbox(ui, &mut checked, "Start at login");
+                                    accent_checkbox(
+                                        ui,
+                                        &mut checked,
+                                        "Start minimized into the system tray",
+                                    );
+                                    accent_checkbox(ui, &mut checked, "Enable sounds");
+                                    window_transparency_slider(ui, &mut 0);
+                                });
+                            });
+                    });
+            },
+        );
+        let card_shape = output
+            .shapes
+            .iter()
+            .find(|shape| {
+                matches!(
+                    &shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == CARD
+                )
+            })
+            .expect("application behavior card was painted");
+        if let egui::epaint::Shape::Rect(rect) = &card_shape.shape {
+            assert!(
+                rect.rect.bottom() + 1.0 <= card_shape.clip_rect.bottom(),
+                "card bottom {} is clipped at {}",
+                rect.rect.bottom(),
+                card_shape.clip_rect.bottom()
+            );
+        }
     }
 
     #[test]
